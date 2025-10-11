@@ -1,0 +1,41 @@
+[package]
+name = "lolcat-ultra"
+version = "0.1.0"
+edition = "2024"
+authors = ["Brian Gosnell <dbrian@gmail.com>"]
+description = "A Rust implementation of lolcat"
+
+[lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+inline_always = "allow"
+
+# Optimization settings for release builds
+[profile.release]
+opt-level = 3
+strip = true
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"
+incremental = false
+
+# Profile for profiling: optimized but with debug symbols
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = false
+
+[dependencies]
+anyhow = "1.0"
+arrayvec = "0.7"
+itoa = "1.0"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
