@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Brian Gosnell <dbrian@gmail.com>"]
 description = "A Rust implementation of lolcat"
+license = "MIT"
+repository = "https://github.com/dbrian/lolcat-ultra"
+homepage = "https://github.com/dbrian/lolcat-ultra"
+keywords = ["lolcat", "rainbow", "color", "cli", "terminal"]
+categories = ["command-line-utilities"]
+readme = "README.md"
 
 [lints.rust]
 unsafe_code = "forbid"
