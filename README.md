@@ -7,12 +7,7 @@ This project exists primarily to help me learn performance optimization in Rust.
 
 ## Performance
 
-The hot path, the character-processing loop, has:
-
-- Zero allocations
-- Zero runtime initialization
-- All lookups from static tables (precomputed during build)
-- Stack-allocated buffers only
+We achive performance by moving work out of the hot path. At build time we precompute rainbow tables and ANSI sequences to avoid runtime formatting. At runtime we use fixed-point integer math (no floating point operations).
 
 ## Benchmarks (M4 Laptop)
 
