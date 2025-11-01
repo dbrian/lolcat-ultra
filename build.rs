@@ -18,6 +18,25 @@ fn fast_f64_to_u8_sat(x: f64) -> u8 {
     y as u8
 }
 
+/// Convert RGB to 256-color palette (duplicated from color.rs for build script)
+const fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
+    if r == g && g == b {
+        if r < 8 {
+            16
+        } else if r > 248 {
+            231
+        } else {
+            232 + (((((r as u16) - 8) * 25) >> 8) as u8)
+        }
+    } else {
+        // Approximate division by 51 with bit shift
+        let r6 = ((r as u16) * 5) >> 8;
+        let g6 = ((g as u16) * 5) >> 8;
+        let b6 = ((b as u16) * 5) >> 8;
+        (16 + 36 * r6 + 6 * g6 + b6) as u8
+    }
+}
+
 /// Build frequency-agnostic rainbow color table using trig recurrence
 fn build_table() -> [Color; TABLE_SIZE] {
     let mut arr = [Color(0, 0, 0); TABLE_SIZE];
@@ -103,6 +122,20 @@ fn main() {
         seq.push(b'm');
 
         writeln!(f, "    {},", format_byte_array(&seq)).unwrap();
+    }
+    writeln!(f, "];").unwrap();
+    writeln!(f).unwrap();
+
+    // Write the 256-color code cache for rainbow table
+    writeln!(f, "// Auto-generated 256-color codes for rainbow table").unwrap();
+    writeln!(
+        f,
+        "pub(crate) const RAINBOW_256_CODES: [u8; {TABLE_SIZE}] = ["
+    )
+    .unwrap();
+    for color in &table {
+        let code_256 = rgb_to_256(color.0, color.1, color.2);
+        write!(f, "{code_256},").unwrap();
     }
     writeln!(f, "];").unwrap();
     writeln!(f).unwrap();

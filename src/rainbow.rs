@@ -49,6 +49,13 @@ impl RainbowLookup {
         ANSI_TRUECOLOR_CACHE[idx]
     }
 
+    /// Get pre-computed 256-color code for a table index
+    #[inline(always)]
+    #[must_use]
+    pub fn get_256_code(&self, idx: usize) -> u8 {
+        RAINBOW_256_CODES[idx]
+    }
+
     /// Helper method to compute table index from position
     #[inline(always)]
     fn index_from_position(&self, position: f64) -> usize {
