@@ -132,7 +132,7 @@ where
                 // Expand tab as 8 spaces
                 for _ in 0..8 {
                     // Fast fixed-point color lookup - no float math
-                    let (_color, color_idx) = lookup.color_from_phase(phase);
+                    let color_idx = lookup.color_index_from_phase(phase);
 
                     // Only output ANSI if color changed
                     if last_color_idx != Some(color_idx) {
@@ -149,7 +149,7 @@ where
             }
             _ => {
                 // Fast fixed-point color lookup - no float math
-                let (_color, color_idx) = lookup.color_from_phase(phase);
+                let color_idx = lookup.color_index_from_phase(phase);
 
                 // Only output ANSI if color changed
                 if last_color_idx != Some(color_idx) {
