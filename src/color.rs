@@ -22,12 +22,17 @@ pub fn detect_color_support(force_color: bool) -> ColorMode {
     let vscode_inj = env::var("VSCODE_INJECTION").is_ok();
     let ci = env::var("CI").is_ok() || env::var("GITHUB_ACTIONS").is_ok();
 
-    // 1) NO_COLOR wins, always
+    // NO_COLOR wins, always
     if no_color.is_some() {
         return ColorMode::NoColor;
     }
 
-    // 2) FORCE_COLOR environment variable (align with widespread conventions)
+    // Command-line --force flag
+    if force_color {
+        return ColorMode::TrueColor;
+    }
+
+    // FORCE_COLOR environment variable (align with widespread conventions)
     if let Some(ref v) = force_color_env {
         // FORCE_COLOR=0 → disable; FORCE_COLOR empty/1/2/3 → enable various levels
         if v == "0" {
@@ -41,24 +46,19 @@ pub fn detect_color_support(force_color: bool) -> ColorMode {
         };
     }
 
-    // 3) Command-line --force flag
-    if force_color {
-        return ColorMode::TrueColor;
-    }
-
-    // 4) If stdout is not a tty and we haven't been forced, disable color
+    // If stdout is not a tty and we haven't been forced, disable color
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         return ColorMode::NoColor;
     }
 
-    // 5) TERM=dumb/unknown disables unless forced
+    // TERM=dumb/unknown disables unless forced
     if let Some(ref t) = term_lower {
         if t == "dumb" || t == "unknown" {
             return ColorMode::NoColor;
         }
     }
 
-    // 6) Strong truecolor signals
+    // Strong truecolor signals
     let has_truecolor_signal = colorterm_l.as_deref().is_some_and(|c| (c.contains("truecolor") || c.contains("24bit"))) ||
         term_program_l
             .as_deref()
