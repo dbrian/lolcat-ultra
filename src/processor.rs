@@ -3,7 +3,7 @@ use arrayvec::ArrayVec;
 use std::io::{self, BufRead, BufWriter, Write};
 
 use crate::ansi::process_ansi_escape;
-use crate::color::{Color, ColorMode, detect_color_support, rgb_to_256};
+use crate::color::{ColorMode, detect_color_support};
 use crate::config::Config;
 use crate::rainbow::RainbowLookup;
 
@@ -24,28 +24,18 @@ fn get_ansi_256(code: u8) -> &'static [u8] {
 /// Buffer capacity for line processing
 const BUF_CAP: usize = 8192;
 
-/// Helper to write ANSI color sequence to buffer using pre-cached sequences
-#[inline]
-fn write_ansi_to_buffer(
-    buf: &mut ArrayVec<u8, BUF_CAP>,
-    color_idx: usize,
-    color_mode: ColorMode,
-    color: Color,
-    lookup: &RainbowLookup,
-) {
-    match color_mode {
-        ColorMode::TrueColor => {
-            // Use pre-cached ANSI sequence - single extend_from_slice, no itoa calls
-            buf.try_extend_from_slice(lookup.get_truecolor_ansi(color_idx))
-                .unwrap();
-        }
-        ColorMode::Color256 => {
-            let code = rgb_to_256(color.0, color.1, color.2);
-            // Use pre-cached ANSI sequence
-            buf.try_extend_from_slice(get_ansi_256(code)).unwrap();
-        }
-        ColorMode::NoColor => {}
-    }
+/// Helper to write ANSI TrueColor sequence to buffer
+#[inline(always)]
+fn write_ansi_truecolor(buf: &mut ArrayVec<u8, BUF_CAP>, color_idx: usize, lookup: &RainbowLookup) {
+    buf.try_extend_from_slice(lookup.get_truecolor_ansi(color_idx))
+        .unwrap();
+}
+
+/// Helper to write ANSI 256-color sequence to buffer
+#[inline(always)]
+fn write_ansi_256color(buf: &mut ArrayVec<u8, BUF_CAP>, color_idx: usize, lookup: &RainbowLookup) {
+    let code = lookup.get_256_code(color_idx);
+    buf.try_extend_from_slice(get_ansi_256(code)).unwrap();
 }
 
 /// Flush buffer if getting close to capacity
@@ -75,17 +65,46 @@ fn process_line_streaming<W: Write>(
 ) -> Result<()> {
     debug_assert!(start_pos.is_finite(), "Start position must be finite");
 
-    if color_mode == ColorMode::NoColor {
-        // Single buffered write (line + newline)
-        writer
-            .write_all(line.as_bytes())
-            .context("Failed to write line without color")?;
-        writer
-            .write_all(b"\n")
-            .context("Failed to write newline without color")?;
-        return Ok(());
+    // Dispatch to monomorphic implementation based on color mode
+    match color_mode {
+        ColorMode::NoColor => {
+            // Fast path: no color processing needed
+            writer
+                .write_all(line.as_bytes())
+                .context("Failed to write line without color")?;
+            writer
+                .write_all(b"\n")
+                .context("Failed to write newline without color")?;
+            Ok(())
+        }
+        ColorMode::TrueColor => process_line_with_color(
+            line,
+            start_pos,
+            config,
+            lookup,
+            writer,
+            write_ansi_truecolor,
+        ),
+        ColorMode::Color256 => {
+            process_line_with_color(line, start_pos, config, lookup, writer, write_ansi_256color)
+        }
     }
+}
 
+/// Monomorphic color processing implementation
+/// This function is generic over the ANSI writer to enable complete inlining
+#[inline]
+fn process_line_with_color<W: Write, F>(
+    line: &str,
+    start_pos: f64,
+    config: &Config,
+    lookup: &RainbowLookup,
+    writer: &mut W,
+    write_ansi: F,
+) -> Result<()>
+where
+    F: Fn(&mut ArrayVec<u8, BUF_CAP>, usize, &RainbowLookup),
+{
     // Stack-allocated buffer - 8KB for better cache locality
     let mut buf = ArrayVec::<u8, BUF_CAP>::new();
 
@@ -113,11 +132,11 @@ fn process_line_streaming<W: Write>(
                 // Expand tab as 8 spaces
                 for _ in 0..8 {
                     // Fast fixed-point color lookup - no float math
-                    let (color, color_idx) = lookup.color_from_phase(phase);
+                    let (_color, color_idx) = lookup.color_from_phase(phase);
 
                     // Only output ANSI if color changed
                     if last_color_idx != Some(color_idx) {
-                        write_ansi_to_buffer(&mut buf, color_idx, color_mode, color, lookup);
+                        write_ansi(&mut buf, color_idx, lookup);
                         last_color_idx = Some(color_idx);
                     }
 
@@ -130,11 +149,11 @@ fn process_line_streaming<W: Write>(
             }
             _ => {
                 // Fast fixed-point color lookup - no float math
-                let (color, color_idx) = lookup.color_from_phase(phase);
+                let (_color, color_idx) = lookup.color_from_phase(phase);
 
                 // Only output ANSI if color changed
                 if last_color_idx != Some(color_idx) {
-                    write_ansi_to_buffer(&mut buf, color_idx, color_mode, color, lookup);
+                    write_ansi(&mut buf, color_idx, lookup);
                     last_color_idx = Some(color_idx);
                 }
 
@@ -205,31 +224,34 @@ impl<W: Write> BatchProcessor<W> {
     }
 }
 
-/// Process input from a reader, applying rainbow colors to each line
+/// Process input with a specific color mode (for testing/benchmarking)
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - Reading from the input reader fails
-/// - Writing to stdout fails
+/// - Writing to the output writer fails
 /// - Maximum line limit is exceeded
-pub fn process_input<R: BufRead>(reader: R, config: &Config) -> Result<()> {
+pub fn process_input_with_color_mode<R: BufRead, W: Write>(
+    reader: R,
+    writer: W,
+    config: &Config,
+    color_mode: ColorMode,
+) -> Result<()> {
     // Maximum number of lines to process to ensure statically provable upper bound
     // This prevents infinite loops when reading from stdin or very large files
     const MAX_LINES: usize = 1_000_000_000;
 
-    let color_mode = detect_color_support(config.force_color);
-
     // Fast path: when no color, just copy input to output like cat
     if color_mode == ColorMode::NoColor {
-        let mut stdout = io::stdout().lock();
+        let mut writer = writer;
         let mut reader = reader;
         loop {
             let n = reader.fill_buf().context("Failed to read input")?;
             if n.is_empty() {
                 break;
             }
-            stdout.write_all(n).context("Failed to write output")?;
+            writer.write_all(n).context("Failed to write output")?;
             let n = n.len();
             reader.consume(n);
         }
@@ -237,8 +259,7 @@ pub fn process_input<R: BufRead>(reader: R, config: &Config) -> Result<()> {
     }
 
     // Color processing path
-    let stdout = io::stdout().lock();
-    let mut processor = BatchProcessor::new(stdout, config);
+    let mut processor = BatchProcessor::new(writer, config);
     let mut line_count = 0.0;
 
     for (processed_lines, line) in reader.lines().enumerate() {
@@ -262,4 +283,36 @@ pub fn process_input<R: BufRead>(reader: R, config: &Config) -> Result<()> {
     }
 
     processor.finish()
+}
+
+/// Process input from a reader, applying rainbow colors to each line, writing to a custom writer
+///
+/// This is primarily for benchmarking and testing purposes.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Reading from the input reader fails
+/// - Writing to the output writer fails
+/// - Maximum line limit is exceeded
+pub fn process_input_to_writer<R: BufRead, W: Write>(
+    reader: R,
+    writer: W,
+    config: &Config,
+) -> Result<()> {
+    let color_mode = detect_color_support(config.force_color);
+    process_input_with_color_mode(reader, writer, config, color_mode)
+}
+
+/// Process input from a reader, applying rainbow colors to each line
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Reading from the input reader fails
+/// - Writing to stdout fails
+/// - Maximum line limit is exceeded
+pub fn process_input<R: BufRead>(reader: R, config: &Config) -> Result<()> {
+    let stdout = io::stdout().lock();
+    process_input_to_writer(reader, stdout, config)
 }
