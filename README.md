@@ -19,4 +19,4 @@ $ time yes "test line" | head -n 10000000 | lolcat-ultra -F > /dev/null
 
 [ur0/lolcat](https://github.com/ur0/lolcat) - Another Rust port _(21.16s)_
 
-lolcat-ultra _(0.86s)_
+lolcat-ultra _(0.77s)_
