@@ -90,6 +90,16 @@ impl RainbowLookup {
         (RAINBOW_TABLE[idx], idx)
     }
 
+    /// Get only the table index for a fixed-point phase value.
+    ///
+    /// This is useful for hot paths that only need the cached ANSI
+    /// sequences and can skip fetching the full `Color` struct.
+    #[inline(always)]
+    #[must_use]
+    pub fn color_index_from_phase(&self, phase: u64) -> usize {
+        ((phase >> 32) as usize) & MASK
+    }
+
     /// Calculate how many glyphs until the color index changes.
     /// Useful for batching identical color runs.
     #[inline(always)]
