@@ -49,3 +49,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "processor_bench"
 harness = false
+
+[[bench]]
+name = "rgb_to_256"
+harness = false

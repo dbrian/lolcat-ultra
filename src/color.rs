@@ -124,22 +124,17 @@ pub fn detect_color_support(force_color: bool) -> ColorMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color(pub u8, pub u8, pub u8);
 
+include!(concat!(env!("OUT_DIR"), "/color_tables.rs"));
+
 #[inline]
 #[must_use]
 pub const fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
     if r == g && g == b {
-        if r < 8 {
-            16
-        } else if r > 248 {
-            231
-        } else {
-            232 + (((((r as u16) - 8) * 25) >> 8) as u8)
-        }
+        GRAY_CODES[r as usize]
     } else {
-        // Approximate division by 51 with bit shift
-        let r6 = ((r as u16) * 5) >> 8;
-        let g6 = ((g as u16) * 5) >> 8;
-        let b6 = ((b as u16) * 5) >> 8;
+        let r6 = SCALE5[r as usize] as u16;
+        let g6 = SCALE5[g as usize] as u16;
+        let b6 = SCALE5[b as usize] as u16;
         (16 + 36 * r6 + 6 * g6 + b6) as u8
     }
 }
