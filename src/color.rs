@@ -124,22 +124,45 @@ pub fn detect_color_support(force_color: bool) -> ColorMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color(pub u8, pub u8, pub u8);
 
+const fn build_scale5() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        table[i] = (((i as u16) * 5) >> 8) as u8;
+        i += 1;
+    }
+    table
+}
+
+const fn build_gray_codes() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let value = i as u8;
+        table[i] = if value < 8 {
+            16
+        } else if value > 248 {
+            231
+        } else {
+            232 + (((((value as u16) - 8) * 25) >> 8) as u8)
+        };
+        i += 1;
+    }
+    table
+}
+
+const SCALE5: [u8; 256] = build_scale5();
+const GRAY_CODES: [u8; 256] = build_gray_codes();
+
 #[inline]
 #[must_use]
 pub const fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
     if r == g && g == b {
-        if r < 8 {
-            16
-        } else if r > 248 {
-            231
-        } else {
-            232 + (((((r as u16) - 8) * 25) >> 8) as u8)
-        }
+        GRAY_CODES[r as usize]
     } else {
-        // Approximate division by 51 with bit shift
-        let r6 = ((r as u16) * 5) >> 8;
-        let g6 = ((g as u16) * 5) >> 8;
-        let b6 = ((b as u16) * 5) >> 8;
+        let r6 = SCALE5[r as usize] as u16;
+        let g6 = SCALE5[g as usize] as u16;
+        let b6 = SCALE5[b as usize] as u16;
         (16 + 36 * r6 + 6 * g6 + b6) as u8
     }
 }

@@ -1,4 +1,4 @@
-use std::io::{ self, BufReader };
+use std::io::{self, BufReader};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
@@ -62,24 +62,20 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-f" | "--frequency" => {
-                let value = args.next().ok_or_else(|| format!("missing value for '{arg}'"))?;
-                frequency = value
-                    .parse()
-                    .map_err(|_| {
-                        format!(
-                            "invalid value '{value}' for '{arg}': expected a floating point number"
-                        )
-                    })?;
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for '{arg}'"))?;
+                frequency = value.parse().map_err(|_| {
+                    format!("invalid value '{value}' for '{arg}': expected a floating point number")
+                })?;
             }
             "-s" | "--spread" => {
-                let value = args.next().ok_or_else(|| format!("missing value for '{arg}'"))?;
-                spread = value
-                    .parse()
-                    .map_err(|_| {
-                        format!(
-                            "invalid value '{value}' for '{arg}': expected a floating point number"
-                        )
-                    })?;
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for '{arg}'"))?;
+                spread = value.parse().map_err(|_| {
+                    format!("invalid value '{value}' for '{arg}': expected a floating point number")
+                })?;
             }
             "-F" | "--force" => {
                 force = true;
@@ -108,8 +104,7 @@ fn main() {
     // Set up terminal cleanup to ensure proper reset on exit
     lolcat_ultra::setup_terminal_cleanup();
 
-    let program_name = std::env
-        ::args()
+    let program_name = std::env::args()
         .next()
         .unwrap_or_else(|| "lolcat-ultra".to_string());
 
