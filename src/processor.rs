@@ -116,9 +116,17 @@ where
     let mut last_color_idx: Option<usize> = None;
 
     let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => {
+
+    // Optimization: if phase_inc is small, we can process chunks of characters
+    // that share the same color index without recalculating it.
+    // Threshold chosen to balance division cost vs batch benefit.
+    // 1 << 28 corresponds to approx 16 steps per color index change.
+    if phase_inc > 0 && phase_inc < (1 << 28) {
+        while chars.peek().is_some() {
+            let c_peek = *chars.peek().unwrap();
+
+            if c_peek == '\x1b' {
+                let c = chars.next().unwrap();
                 // Flush accumulated buffer before ANSI escape
                 if !buf.is_empty() {
                     writer.write_all(&buf)?;
@@ -127,8 +135,9 @@ where
                 process_ansi_escape(writer, &mut chars, c)?;
                 // Reset color tracking after ANSI escape
                 last_color_idx = None;
-            }
-            '\t' => {
+                continue;
+            } else if c_peek == '\t' {
+                let _ = chars.next().unwrap();
                 // Expand tab as 8 spaces
                 for _ in 0..8 {
                     // Fast fixed-point color lookup - no float math
@@ -146,30 +155,102 @@ where
                     // Smart flush based on remaining capacity
                     maybe_flush(writer, &mut buf)?;
                 }
+                continue;
             }
-            _ => {
-                // Fast fixed-point color lookup - no float math
-                let color_idx = lookup.color_index_from_phase(phase);
 
-                // Only output ANSI if color changed
-                if last_color_idx != Some(color_idx) {
-                    write_ansi(&mut buf, color_idx, lookup);
-                    last_color_idx = Some(color_idx);
-                }
+            // Normal character batching
+            let color_idx = lookup.color_index_from_phase(phase);
+            if last_color_idx != Some(color_idx) {
+                write_ansi(&mut buf, color_idx, lookup);
+                last_color_idx = Some(color_idx);
+            }
 
-                // Write character - use ASCII fast path when possible
-                if c.is_ascii() {
-                    buf.push(c as u8);
+            let max_run = lookup.run_len_until_next_index(phase, phase_inc);
+            let mut processed = 0;
+
+            // Inner loop: consume up to max_run normal chars
+            // Also check buffer capacity to prevent overflow
+            while processed < max_run && buf.remaining_capacity() >= 4 {
+                if let Some(&c) = chars.peek() {
+                    if c == '\x1b' || c == '\t' {
+                        break;
+                    }
+                    chars.next(); // consume
+
+                    if c.is_ascii() {
+                        buf.push(c as u8);
+                    } else {
+                        let mut utf8 = [0u8; 4];
+                        let char_bytes = c.encode_utf8(&mut utf8).as_bytes();
+                        buf.try_extend_from_slice(char_bytes).unwrap();
+                    }
+                    processed += 1;
                 } else {
-                    let mut utf8 = [0u8; 4];
-                    let char_bytes = c.encode_utf8(&mut utf8).as_bytes();
-                    buf.try_extend_from_slice(char_bytes).unwrap();
+                    break;
                 }
+            }
 
-                phase = phase.wrapping_add(phase_inc);
-
-                // Smart flush based on remaining capacity
+            if processed > 0 {
+                phase = phase.wrapping_add(phase_inc.wrapping_mul(processed as u64));
                 maybe_flush(writer, &mut buf)?;
+            }
+        }
+    } else {
+        while let Some(c) = chars.next() {
+            match c {
+                '\x1b' => {
+                    // Flush accumulated buffer before ANSI escape
+                    if !buf.is_empty() {
+                        writer.write_all(&buf)?;
+                        buf.clear();
+                    }
+                    process_ansi_escape(writer, &mut chars, c)?;
+                    // Reset color tracking after ANSI escape
+                    last_color_idx = None;
+                }
+                '\t' => {
+                    // Expand tab as 8 spaces
+                    for _ in 0..8 {
+                        // Fast fixed-point color lookup - no float math
+                        let color_idx = lookup.color_index_from_phase(phase);
+
+                        // Only output ANSI if color changed
+                        if last_color_idx != Some(color_idx) {
+                            write_ansi(&mut buf, color_idx, lookup);
+                            last_color_idx = Some(color_idx);
+                        }
+
+                        buf.push(b' ');
+                        phase = phase.wrapping_add(phase_inc);
+
+                        // Smart flush based on remaining capacity
+                        maybe_flush(writer, &mut buf)?;
+                    }
+                }
+                _ => {
+                    // Fast fixed-point color lookup - no float math
+                    let color_idx = lookup.color_index_from_phase(phase);
+
+                    // Only output ANSI if color changed
+                    if last_color_idx != Some(color_idx) {
+                        write_ansi(&mut buf, color_idx, lookup);
+                        last_color_idx = Some(color_idx);
+                    }
+
+                    // Write character - use ASCII fast path when possible
+                    if c.is_ascii() {
+                        buf.push(c as u8);
+                    } else {
+                        let mut utf8 = [0u8; 4];
+                        let char_bytes = c.encode_utf8(&mut utf8).as_bytes();
+                        buf.try_extend_from_slice(char_bytes).unwrap();
+                    }
+
+                    phase = phase.wrapping_add(phase_inc);
+
+                    // Smart flush based on remaining capacity
+                    maybe_flush(writer, &mut buf)?;
+                }
             }
         }
     }
@@ -233,7 +314,7 @@ impl<W: Write> BatchProcessor<W> {
 /// - Writing to the output writer fails
 /// - Maximum line limit is exceeded
 pub fn process_input_with_color_mode<R: BufRead, W: Write>(
-    reader: R,
+    mut reader: R,
     writer: W,
     config: &Config,
     color_mode: ColorMode,
@@ -245,7 +326,6 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
     // Fast path: when no color, just copy input to output like cat
     if color_mode == ColorMode::NoColor {
         let mut writer = writer;
-        let mut reader = reader;
         loop {
             let n = reader.fill_buf().context("Failed to read input")?;
             if n.is_empty() {
@@ -260,26 +340,43 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
 
     // Color processing path
     let mut processor = BatchProcessor::new(writer, config);
-    let mut line_count = 0.0;
+    let mut line_buf = String::with_capacity(1024);
+    let mut lines_read = 0;
 
-    for (processed_lines, line) in reader.lines().enumerate() {
-        if processed_lines >= MAX_LINES {
+    loop {
+        if lines_read >= MAX_LINES {
             // Safety limit reached - prevent unbounded processing
             break;
         }
 
-        let line = line.context("Failed to read line")?;
+        line_buf.clear();
+        let n = reader
+            .read_line(&mut line_buf)
+            .context("Failed to read line")?;
+        if n == 0 {
+            break;
+        }
+
+        // Trim trailing newline to match lines() behavior
+        let mut line_len = line_buf.len();
+        if line_buf.ends_with('\n') {
+            line_len -= 1;
+            if line_len > 0 && line_buf.as_bytes()[line_len - 1] == b'\r' {
+                line_len -= 1;
+            }
+        }
+        let line = &line_buf[..line_len];
 
         // Calculate start position for this line
-        let start_pos = line_count * config.spread + config.random_offset;
+        let start_pos = (lines_read as f64) * config.spread + config.random_offset;
         debug_assert!(
             start_pos.is_finite(),
             "Calculated start position must be finite"
         );
 
-        processor.process_line(&line, start_pos, config, color_mode)?;
+        processor.process_line(line, start_pos, config, color_mode)?;
 
-        line_count += 1.0;
+        lines_read += 1;
     }
 
     processor.finish()

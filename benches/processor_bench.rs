@@ -201,11 +201,40 @@ fn bench_process_mixed(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_process_slow_change(c: &mut Criterion) {
+    let mut group = c.benchmark_group("process_slow_change");
+
+    let input = generate_ascii_lines(1000, 80);
+    let size = input.len();
+
+    group.throughput(Throughput::Bytes(size as u64));
+    group.bench_function("slow_truecolor", |b| {
+        b.iter(|| {
+            let reader = BufReader::new(Cursor::new(input.as_bytes()));
+            let writer = Sink;
+            // Very low frequency and high spread = color stays same for many chars
+            let config = Config::try_new(0.001, 10.0, false).unwrap();
+
+            let result = process_input_with_color_mode(
+                reader,
+                writer,
+                black_box(&config),
+                ColorMode::TrueColor,
+            );
+
+            result.unwrap()
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_process_truecolor,
     bench_process_256color,
     bench_process_unicode,
-    bench_process_mixed
+    bench_process_mixed,
+    bench_process_slow_change
 );
 criterion_main!(benches);

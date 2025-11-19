@@ -7,7 +7,7 @@ This project exists primarily to help me learn performance optimization in Rust.
 
 ## Performance
 
-We achive performance by moving work out of the hot path. At build time we precompute rainbow tables and ANSI sequences to avoid runtime formatting. At runtime we use fixed-point integer math (no floating point operations).
+We achive performance by moving work out of the hot path. At build time we precompute rainbow tables and ANSI sequences to avoid runtime formatting. At runtime we use fixed-point integer math in the hot path (no floating point operations per character).
 
 ## Building
 
@@ -54,6 +54,6 @@ $ time yes "test line" | head -n 10000000 | lolcat-ultra -F > /dev/null
 
 [ur0/lolcat](https://github.com/ur0/lolcat) - Another Rust port _(21.16s)_
 
-lolcat-ultra - Standard release build _(0.77s)_
+lolcat-ultra - Standard release build _(0.66s)_
 
-lolcat-ultra - PGO optimized build _(0.71s)_
+lolcat-ultra - PGO optimized build _(0.60s)_
