@@ -24,7 +24,7 @@ fn get_ansi_256(code: u8) -> &'static [u8] {
 /// Buffer capacity for line processing
 const BUF_CAP: usize = 8192;
 
-/// Helper to write ANSI TrueColor sequence to buffer
+/// Helper to write ANSI `TrueColor` sequence to buffer
 #[inline(always)]
 fn write_ansi_truecolor(buf: &mut ArrayVec<u8, BUF_CAP>, color_idx: usize, lookup: &RainbowLookup) {
     buf.try_extend_from_slice(lookup.get_truecolor_ansi(color_idx))
@@ -94,6 +94,7 @@ fn process_line_streaming<W: Write>(
 /// Monomorphic color processing implementation
 /// This function is generic over the ANSI writer to enable complete inlining
 #[inline]
+#[allow(clippy::too_many_lines)]
 fn process_line_with_color<W: Write, F>(
     line: &str,
     start_pos: f64,

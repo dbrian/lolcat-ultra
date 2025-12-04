@@ -52,14 +52,14 @@ pub fn detect_color_support(force_color: bool) -> ColorMode {
     }
 
     // TERM=dumb/unknown disables unless forced
-    if let Some(ref t) = term_lower {
-        if t == "dumb" || t == "unknown" {
-            return ColorMode::NoColor;
-        }
+    if let Some(ref t) = term_lower
+        && (t == "dumb" || t == "unknown")
+    {
+        return ColorMode::NoColor;
     }
 
     // Strong truecolor signals
-    let has_truecolor_signal = colorterm_l.as_deref().is_some_and(|c| (c.contains("truecolor") || c.contains("24bit"))) ||
+    let has_truecolor_signal = colorterm_l.as_deref().is_some_and(|c| c.contains("truecolor") || c.contains("24bit")) ||
         term_program_l
             .as_deref()
             .is_some_and(
@@ -105,11 +105,11 @@ pub fn detect_color_support(force_color: bool) -> ColorMode {
     }
 
     // 8) Basic color signals from TERM
-    if let Some(ref t) = term_lower {
-        if t.contains("xterm") || t.contains("ansi") || t.contains("vt100") || t.contains("color") {
-            // If it wasn't explicitly 256color, use 256 color support.
-            return ColorMode::Color256;
-        }
+    if let Some(ref t) = term_lower
+        && (t.contains("xterm") || t.contains("ansi") || t.contains("vt100") || t.contains("color"))
+    {
+        // If it wasn't explicitly 256color, use 256 color support.
+        return ColorMode::Color256;
     }
 
     // 9) CI environments: enable at least 256 color

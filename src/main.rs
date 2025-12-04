@@ -5,7 +5,7 @@ const AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
 const ABOUT: &str = "cat with rainbow colors";
 
 struct Args {
-    input: Option<std::path::PathBuf>,
+    inputs: Vec<std::path::PathBuf>,
     frequency: f64,
     spread: f64,
     force: bool,
@@ -22,10 +22,10 @@ fn print_help(program_name: &str) {
     let help_text = format!(
         "{ABOUT}\n\
         \n\
-        Usage: {program_name} [OPTIONS] [FILE]\n\
+        Usage: {program_name} [OPTIONS] [FILE]...\n\
         \n\
         Arguments:\n\
-        \x20 [FILE]  input file\n\
+        \x20 [FILE]...  Input files (reads from stdin if none provided)\n\
         \n\
         Options:\n\
         \x20 -f, --frequency <FREQUENCY>  Color change frequency [default: 0.04]\n\
@@ -46,7 +46,7 @@ fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args();
     let program_name = args.next().unwrap_or_else(|| "lolcat-ultra".to_string());
 
-    let mut input: Option<std::path::PathBuf> = None;
+    let mut inputs: Vec<std::path::PathBuf> = Vec::new();
     let mut frequency = 0.04;
     let mut spread = 4.0;
     let mut force = false;
@@ -84,16 +84,13 @@ fn parse_args() -> Result<Args, String> {
                 return Err(format!("unknown option: {arg}"));
             }
             _ => {
-                if input.is_some() {
-                    return Err("unexpected argument: only one input file is allowed".to_string());
-                }
-                input = Some(std::path::PathBuf::from(arg));
+                inputs.push(std::path::PathBuf::from(arg));
             }
         }
     }
 
     Ok(Args {
-        input,
+        inputs,
         frequency,
         spread,
         force,
@@ -125,25 +122,37 @@ fn main() {
         }
     };
 
-    let result = if let Some(path) = args.input {
-        match std::fs::File::open(&path) {
-            Ok(file) => {
-                let reader = BufReader::new(file);
-                lolcat_ultra::process_input(reader, &config)
-            }
-            Err(e) => {
-                eprintln!("{program_name}: {}: {e}", path.display());
-                std::process::exit(1);
-            }
-        }
-    } else {
+    // Track if any errors occurred
+    let mut had_error = false;
+
+    if args.inputs.is_empty() {
+        // No files provided: read from stdin
         let stdin = io::stdin();
         let reader = stdin.lock();
-        lolcat_ultra::process_input(reader, &config)
-    };
+        if let Err(e) = lolcat_ultra::process_input(reader, &config) {
+            eprintln!("{program_name}: {e}");
+            had_error = true;
+        }
+    } else {
+        // Process each file in order
+        for path in &args.inputs {
+            match std::fs::File::open(path) {
+                Ok(file) => {
+                    let reader = BufReader::new(file);
+                    if let Err(e) = lolcat_ultra::process_input(reader, &config) {
+                        eprintln!("{program_name}: {}: {e}", path.display());
+                        had_error = true;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{program_name}: {}: {e}", path.display());
+                    had_error = true;
+                }
+            }
+        }
+    }
 
-    if let Err(e) = result {
-        eprintln!("{program_name}: {e}");
+    if had_error {
         std::process::exit(1);
     }
 }

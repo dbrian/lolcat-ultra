@@ -177,7 +177,7 @@ fn main() {
         } else if value > 248 {
             231
         } else {
-            232 + ((((value as u16 - 8) * 25) >> 8) as u8)
+            232 + ((((u16::from(value) - 8) * 25) >> 8) as u8)
         };
         writeln!(color_file, "    {code},").unwrap();
     }
