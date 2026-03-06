@@ -56,7 +56,7 @@ fn maybe_flush<W: Write>(writer: &mut W, buf: &mut ArrayVec<u8, BUF_CAP>) -> io:
 /// - Track last color to avoid redundant ANSI sequences
 /// - Single color lookup per character
 fn process_line_streaming<W: Write>(
-    line: &str,
+    line: &[u8],
     start_pos: f64,
     config: &Config,
     color_mode: ColorMode,
@@ -70,7 +70,7 @@ fn process_line_streaming<W: Write>(
         ColorMode::NoColor => {
             // Fast path: no color processing needed
             writer
-                .write_all(line.as_bytes())
+                .write_all(line)
                 .context("Failed to write line without color")?;
             writer
                 .write_all(b"\n")
@@ -98,7 +98,7 @@ fn process_line_streaming<W: Write>(
 /// raw bytes; the phase counter advances only on codepoint-start bytes.
 #[inline]
 fn process_line_with_color<W: Write, F>(
-    line: &str,
+    line: &[u8],
     start_pos: f64,
     config: &Config,
     lookup: &RainbowLookup,
@@ -118,7 +118,7 @@ where
     // Track last color index to avoid redundant ANSI sequences
     let mut last_color_idx: Option<usize> = None;
 
-    let bytes = line.as_bytes();
+    let bytes = line;
     let len = bytes.len();
     let mut i = 0;
 
@@ -270,7 +270,7 @@ impl<W: Write> BatchProcessor<W> {
 
     fn process_line(
         &mut self,
-        line: &str,
+        line: &[u8],
         start_pos: f64,
         config: &Config,
         color_mode: ColorMode,
@@ -328,7 +328,7 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
 
     // Color processing path
     let mut processor = BatchProcessor::new(writer, config);
-    let mut line_buf = String::with_capacity(1024);
+    let mut line_buf: Vec<u8> = Vec::with_capacity(1024);
     let mut lines_read = 0;
 
     loop {
@@ -339,7 +339,7 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
 
         line_buf.clear();
         let n = reader
-            .read_line(&mut line_buf)
+            .read_until(b'\n', &mut line_buf)
             .context("Failed to read line")?;
         if n == 0 {
             break;
@@ -347,9 +347,9 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
 
         // Trim trailing newline to match lines() behavior
         let mut line_len = line_buf.len();
-        if line_buf.ends_with('\n') {
+        if line_buf.last() == Some(&b'\n') {
             line_len -= 1;
-            if line_len > 0 && line_buf.as_bytes()[line_len - 1] == b'\r' {
+            if line_len > 0 && line_buf[line_len - 1] == b'\r' {
                 line_len -= 1;
             }
         }
