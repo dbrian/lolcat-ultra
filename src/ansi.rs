@@ -4,45 +4,38 @@ use std::io::Write;
 
 pub(crate) const MAX_ANSI_SEQUENCE_LENGTH: usize = 200;
 
+/// Byte-level ANSI escape processor. Reads an ANSI escape sequence starting
+/// at `bytes[pos]` (which should be 0x1B) and writes it directly to `writer`.
+/// Returns the new position after the escape sequence.
 #[inline]
-pub(crate) fn process_ansi_escape<W: Write>(
+pub(crate) fn process_ansi_escape_bytes<W: Write>(
     writer: &mut W,
-    chars: &mut std::iter::Peekable<std::str::Chars>,
-    initial_char: char,
-) -> Result<()> {
-    // Preallocate for worst-case UTF-8: 200 chars × 4 bytes + initial char (4 bytes)
-    // In practice, ANSI sequences are ASCII (~20 bytes), but this ensures safety
-    let mut buf = ArrayVec::<u8, { (MAX_ANSI_SEQUENCE_LENGTH * 4) + 4 }>::new();
+    bytes: &[u8],
+    pos: usize,
+) -> Result<usize> {
+    let mut buf = ArrayVec::<u8, { MAX_ANSI_SEQUENCE_LENGTH + 4 }>::new();
 
-    // Encode initial character (usually ESC or '[')
-    {
-        let mut tmp = [0u8; 4];
-        buf.try_extend_from_slice(initial_char.encode_utf8(&mut tmp).as_bytes())
-            .unwrap();
-    }
-
+    // Push the ESC byte
+    buf.push(bytes[pos]);
+    let mut i = pos + 1;
     let mut ansi_char_count = 0;
-    while let Some(&next) = chars.peek() {
-        if ansi_char_count >= MAX_ANSI_SEQUENCE_LENGTH {
-            break;
-        }
+    let end = bytes.len();
 
-        // Encode next char directly into buffer
-        let mut tmp = [0u8; 4];
-        buf.try_extend_from_slice(next.encode_utf8(&mut tmp).as_bytes())
-            .unwrap();
-
-        chars.next();
+    while i < end && ansi_char_count < MAX_ANSI_SEQUENCE_LENGTH {
+        let b = bytes[i];
+        buf.push(b);
+        i += 1;
         ansi_char_count += 1;
 
         // ANSI sequences end on ASCII alphabetic characters (A–Z, a–z)
-        if next.is_ascii_alphabetic() {
+        if b.is_ascii_alphabetic() {
             break;
         }
     }
 
-    // Single system call / buffer write
     writer
         .write_all(&buf)
-        .context("Failed to write ANSI escape sequence")
+        .context("Failed to write ANSI escape sequence")?;
+
+    Ok(i)
 }

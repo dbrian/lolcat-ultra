@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use arrayvec::ArrayVec;
 use std::io::{self, BufRead, BufWriter, Write};
 
-use crate::ansi::process_ansi_escape;
+use crate::ansi::process_ansi_escape_bytes;
 use crate::color::{ColorMode, detect_color_support};
 use crate::config::Config;
 use crate::rainbow::RainbowLookup;
@@ -92,7 +92,10 @@ fn process_line_streaming<W: Write>(
 }
 
 /// Monomorphic color processing implementation
-/// This function is generic over the ANSI writer to enable complete inlining
+/// This function is generic over the ANSI writer to enable complete inlining.
+/// Uses byte-level iteration to avoid UTF-8 decoding overhead — only \x1b and \t
+/// need detection (both single-byte ASCII). Multi-byte codepoints are copied as
+/// raw bytes; the phase counter advances only on codepoint-start bytes.
 #[inline]
 fn process_line_with_color<W: Write, F>(
     line: &str,
@@ -115,44 +118,37 @@ where
     // Track last color index to avoid redundant ANSI sequences
     let mut last_color_idx: Option<usize> = None;
 
-    let mut chars = line.chars().peekable();
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
 
     // Optimization: if phase_inc is small, we can process chunks of characters
     // that share the same color index without recalculating it.
-    // Threshold chosen to balance division cost vs batch benefit.
-    // 1 << 28 corresponds to approx 16 steps per color index change.
     if phase_inc > 0 && phase_inc < (1 << 28) {
-        while chars.peek().is_some() {
-            let c_peek = *chars.peek().unwrap();
+        while i < len {
+            let b = bytes[i];
 
-            if c_peek == '\x1b' {
-                let c = chars.next().unwrap();
+            if b == 0x1b {
                 // Flush accumulated buffer before ANSI escape
                 if !buf.is_empty() {
                     writer.write_all(&buf)?;
                     buf.clear();
                 }
-                process_ansi_escape(writer, &mut chars, c)?;
-                // Reset color tracking after ANSI escape
+                i = process_ansi_escape_bytes(writer, bytes, i)?;
                 last_color_idx = None;
                 continue;
-            } else if c_peek == '\t' {
-                let _ = chars.next().unwrap();
-                // Expand tab as 8 spaces
-                for _ in 0..8 {
-                    // Fast fixed-point color lookup - no float math
-                    let color_idx = lookup.color_index_from_phase(phase);
+            }
 
-                    // Only output ANSI if color changed
+            if b == b'\t' {
+                i += 1;
+                for _ in 0..8 {
+                    let color_idx = lookup.color_index_from_phase(phase);
                     if last_color_idx != Some(color_idx) {
                         write_ansi(&mut buf, color_idx, lookup);
                         last_color_idx = Some(color_idx);
                     }
-
                     buf.push(b' ');
                     phase = phase.wrapping_add(phase_inc);
-
-                    // Smart flush based on remaining capacity
                     maybe_flush(writer, &mut buf)?;
                 }
                 continue;
@@ -168,26 +164,25 @@ where
             let max_run = lookup.run_len_until_next_index(phase, phase_inc);
             let mut processed = 0;
 
-            // Inner loop: consume up to max_run normal chars
-            // Also check buffer capacity to prevent overflow
-            while processed < max_run && buf.remaining_capacity() >= 4 {
-                if let Some(&c) = chars.peek() {
-                    if c == '\x1b' || c == '\t' {
-                        break;
-                    }
-                    chars.next(); // consume
-
-                    if c.is_ascii() {
-                        buf.push(c as u8);
-                    } else {
-                        let mut utf8 = [0u8; 4];
-                        let char_bytes = c.encode_utf8(&mut utf8).as_bytes();
-                        buf.try_extend_from_slice(char_bytes).unwrap();
-                    }
-                    processed += 1;
-                } else {
+            // Inner loop: consume up to max_run codepoints worth of bytes.
+            // We must never break in the middle of a multi-byte UTF-8 sequence,
+            // as that would allow an ANSI color code to be inserted between
+            // the start byte and continuation bytes, corrupting the character.
+            while i < len && buf.remaining_capacity() >= 4 {
+                let b2 = bytes[i];
+                if b2 == 0x1b || b2 == b'\t' {
                     break;
                 }
+                // Check codepoint-start: if we've already hit max_run,
+                // stop before starting a new codepoint
+                if b2 < 0x80 || b2 >= 0xC0 {
+                    if processed >= max_run {
+                        break;
+                    }
+                    processed += 1;
+                }
+                buf.push(b2);
+                i += 1;
             }
 
             if processed > 0 {
@@ -196,62 +191,55 @@ where
             }
         }
     } else {
-        while let Some(c) = chars.next() {
-            match c {
-                '\x1b' => {
-                    // Flush accumulated buffer before ANSI escape
-                    if !buf.is_empty() {
-                        writer.write_all(&buf)?;
-                        buf.clear();
-                    }
-                    process_ansi_escape(writer, &mut chars, c)?;
-                    // Reset color tracking after ANSI escape
-                    last_color_idx = None;
+        while i < len {
+            let b = bytes[i];
+
+            if b == 0x1b {
+                // Flush accumulated buffer before ANSI escape
+                if !buf.is_empty() {
+                    writer.write_all(&buf)?;
+                    buf.clear();
                 }
-                '\t' => {
-                    // Expand tab as 8 spaces
-                    for _ in 0..8 {
-                        // Fast fixed-point color lookup - no float math
-                        let color_idx = lookup.color_index_from_phase(phase);
+                i = process_ansi_escape_bytes(writer, bytes, i)?;
+                last_color_idx = None;
+                continue;
+            }
 
-                        // Only output ANSI if color changed
-                        if last_color_idx != Some(color_idx) {
-                            write_ansi(&mut buf, color_idx, lookup);
-                            last_color_idx = Some(color_idx);
-                        }
-
-                        buf.push(b' ');
-                        phase = phase.wrapping_add(phase_inc);
-
-                        // Smart flush based on remaining capacity
-                        maybe_flush(writer, &mut buf)?;
-                    }
-                }
-                _ => {
-                    // Fast fixed-point color lookup - no float math
+            if b == b'\t' {
+                i += 1;
+                for _ in 0..8 {
                     let color_idx = lookup.color_index_from_phase(phase);
-
-                    // Only output ANSI if color changed
                     if last_color_idx != Some(color_idx) {
                         write_ansi(&mut buf, color_idx, lookup);
                         last_color_idx = Some(color_idx);
                     }
-
-                    // Write character - use ASCII fast path when possible
-                    if c.is_ascii() {
-                        buf.push(c as u8);
-                    } else {
-                        let mut utf8 = [0u8; 4];
-                        let char_bytes = c.encode_utf8(&mut utf8).as_bytes();
-                        buf.try_extend_from_slice(char_bytes).unwrap();
-                    }
-
+                    buf.push(b' ');
                     phase = phase.wrapping_add(phase_inc);
-
-                    // Smart flush based on remaining capacity
                     maybe_flush(writer, &mut buf)?;
                 }
+                continue;
             }
+
+            // Only emit color on codepoint-start bytes to avoid splitting
+            // multi-byte UTF-8 sequences with ANSI escapes
+            if b < 0x80 || b >= 0xC0 {
+                let color_idx = lookup.color_index_from_phase(phase);
+                if last_color_idx != Some(color_idx) {
+                    write_ansi(&mut buf, color_idx, lookup);
+                    last_color_idx = Some(color_idx);
+                }
+            }
+
+            // Copy byte to buffer
+            buf.push(b);
+            i += 1;
+
+            // Advance phase only on codepoint-start bytes
+            if b < 0x80 || b >= 0xC0 {
+                phase = phase.wrapping_add(phase_inc);
+            }
+
+            maybe_flush(writer, &mut buf)?;
         }
     }
 
@@ -412,4 +400,148 @@ pub fn process_input_to_writer<R: BufRead, W: Write>(
 pub fn process_input<R: BufRead>(reader: R, config: &Config) -> Result<()> {
     let stdout = io::stdout().lock();
     process_input_to_writer(reader, stdout, config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufReader, Cursor};
+
+    /// Strip all ANSI escape sequences from output bytes, returning plain text.
+    fn strip_ansi(input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            if input[i] == 0x1b {
+                i += 1;
+                // Skip CSI sequences: ESC [ ... <letter>
+                if i < input.len() && input[i] == b'[' {
+                    i += 1;
+                    while i < input.len() && !input[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                    if i < input.len() {
+                        i += 1; // skip terminating letter
+                    }
+                }
+            } else {
+                out.push(input[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Process input with color and return the plain text (ANSI stripped).
+    fn process_and_strip(input: &str, color_mode: ColorMode) -> String {
+        let config = Config::try_new(0.04, 4.0, true).unwrap();
+        let reader = BufReader::new(Cursor::new(input.as_bytes()));
+        let mut output = Vec::new();
+        process_input_with_color_mode(reader, &mut output, &config, color_mode).unwrap();
+        let stripped = strip_ansi(&output);
+        String::from_utf8(stripped).expect("output must be valid UTF-8")
+    }
+
+    /// The processor adds a newline after each line. For input ending with
+    /// \n, the last split produces an empty segment that doesn't get a line.
+    fn expected_output(input: &str) -> String {
+        if input.ends_with('\n') {
+            // Input already has trailing newline; processor treats it as
+            // a line followed by EOF, so output matches input exactly.
+            input.to_string()
+        } else {
+            // No trailing newline; processor adds one.
+            format!("{input}\n")
+        }
+    }
+
+    /// Tab expansion: each \t becomes 8 spaces
+    fn expand_tabs(input: &str) -> String {
+        input.replace('\t', "        ")
+    }
+
+    #[test]
+    fn ascii_text_preserved_truecolor() {
+        let input = "Hello, world!\nThe quick brown fox jumps over the lazy dog.";
+        let result = process_and_strip(input, ColorMode::TrueColor);
+        assert_eq!(result, expected_output(input));
+    }
+
+    #[test]
+    fn ascii_text_preserved_256color() {
+        let input = "Hello, world!\nThe quick brown fox jumps over the lazy dog.";
+        let result = process_and_strip(input, ColorMode::Color256);
+        assert_eq!(result, expected_output(input));
+    }
+
+    #[test]
+    fn curly_quotes_preserved() {
+        let input = "I\u{2019}ve been turning over in my mind";
+        let result = process_and_strip(input, ColorMode::TrueColor);
+        assert_eq!(result, expected_output(input));
+    }
+
+    #[test]
+    fn unicode_multibyte_preserved() {
+        let input = "Hello 世界 🌈 Привет مرحبا こんにちは café naïve résumé";
+        let result = process_and_strip(input, ColorMode::TrueColor);
+        assert_eq!(result, expected_output(input));
+    }
+
+    #[test]
+    fn curly_quotes_256color() {
+        let input = "\u{201c}Hello,\u{201d} he said. \u{2018}It\u{2019}s fine.\u{2019}";
+        let result = process_and_strip(input, ColorMode::Color256);
+        assert_eq!(result, expected_output(input));
+    }
+
+    #[test]
+    fn emoji_preserved() {
+        let input = "Emojis: 😀 🎉 ✨ 🚀 💻 🔥 👨‍👩‍👧‍👦";
+        let result = process_and_strip(input, ColorMode::TrueColor);
+        assert_eq!(result, expected_output(input));
+    }
+
+    #[test]
+    fn tabs_expanded() {
+        let input = "col1\tcol2\tcol3";
+        let result = process_and_strip(input, ColorMode::TrueColor);
+        assert_eq!(result, expected_output(&expand_tabs(input)));
+    }
+
+    #[test]
+    fn empty_and_blank_lines() {
+        let input = "\n\n  \n";
+        let result = process_and_strip(input, ColorMode::TrueColor);
+        assert_eq!(result, expected_output(input));
+    }
+
+    #[test]
+    fn all_printable_ascii() {
+        let input: String = (0x20u8..=0x7E).map(|b| b as char).collect();
+        let result = process_and_strip(&input, ColorMode::TrueColor);
+        assert_eq!(result, expected_output(&input));
+    }
+
+    #[test]
+    fn mixed_ascii_and_multibyte_long_line() {
+        // Long line that forces buffer flushes with mixed content
+        let segment = "abc\u{00e9}def\u{2019}ghi\u{4e16}jkl\u{1F308}mno ";
+        let input: String = segment.repeat(200);
+        let result = process_and_strip(&input, ColorMode::TrueColor);
+        assert_eq!(result, expected_output(&input));
+    }
+
+    #[test]
+    fn slow_color_change_preserves_text() {
+        // Low frequency, high spread → batching path
+        let config = Config::try_new(0.001, 10.0, true).unwrap();
+        let input = "I\u{2019}ve got \u{201c}curly quotes\u{201d} and caf\u{00e9}\n";
+        let reader = BufReader::new(Cursor::new(input.as_bytes()));
+        let mut output = Vec::new();
+        process_input_with_color_mode(reader, &mut output, &config, ColorMode::TrueColor).unwrap();
+        let stripped = strip_ansi(&output);
+        let result = String::from_utf8(stripped).expect("output must be valid UTF-8");
+        assert_eq!(result, expected_output(input));
+    }
 }

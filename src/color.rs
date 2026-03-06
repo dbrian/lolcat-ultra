@@ -59,7 +59,7 @@ pub fn detect_color_support(force_color: bool) -> ColorMode {
     }
 
     // Strong truecolor signals
-    let has_truecolor_signal = colorterm_l.as_deref().is_some_and(|c| (c.contains("truecolor") || c.contains("24bit"))) ||
+    let has_truecolor_signal = colorterm_l.as_deref().is_some_and(|c| c.contains("truecolor") || c.contains("24bit")) ||
         term_program_l
             .as_deref()
             .is_some_and(
