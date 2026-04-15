@@ -102,26 +102,35 @@ fn main() {
     .unwrap();
     writeln!(f).unwrap();
 
-    // Write the ANSI truecolor cache
-    writeln!(f, "// Auto-generated ANSI truecolor sequences").unwrap();
+    // Write the fixed-width ANSI truecolor cache (always 20 bytes: 19 content + 1 pad)
+    // Format: \x1b[38;2;XXX;XXX;XXXm using 3-digit zero-padded decimals.
+    // Eliminates fat-pointer indirection and packs all sequences contiguously (~40 KB),
+    // fitting entirely in L1 cache (vs the old ~66 KB pointer-table + separate data).
+    writeln!(f, "// Auto-generated fixed-width ANSI truecolor sequences").unwrap();
     writeln!(
         f,
-        "pub(crate) static ANSI_TRUECOLOR_CACHE: [&[u8]; {TABLE_SIZE}] = ["
+        "pub(crate) static ANSI_TRUECOLOR_FIXED: [[u8; 20]; {TABLE_SIZE}] = ["
     )
     .unwrap();
 
     for color in &table {
-        // Build ANSI sequence for this color
-        let mut seq = Vec::with_capacity(20);
-        seq.extend_from_slice(b"\x1b[38;2;");
-        seq.extend_from_slice(color.0.to_string().as_bytes());
-        seq.push(b';');
-        seq.extend_from_slice(color.1.to_string().as_bytes());
-        seq.push(b';');
-        seq.extend_from_slice(color.2.to_string().as_bytes());
-        seq.push(b'm');
-
-        writeln!(f, "    {},", format_byte_array(&seq)).unwrap();
+        // Format: ESC [ 3 8 ; 2 ; R R R ; G G G ; B B B m  (19 bytes) + 1 padding byte
+        let r = color.0;
+        let g = color.1;
+        let b = color.2;
+        let seq: [u8; 20] = [
+            0x1b, b'[', b'3', b'8', b';', b'2', b';',
+            b'0' + r / 100, b'0' + r / 10 % 10, b'0' + r % 10, b';',
+            b'0' + g / 100, b'0' + g / 10 % 10, b'0' + g % 10, b';',
+            b'0' + b / 100, b'0' + b / 10 % 10, b'0' + b % 10, b'm',
+            0, // padding
+        ];
+        write!(f, "[").unwrap();
+        for (i, byte) in seq.iter().enumerate() {
+            if i > 0 { write!(f, ",").unwrap(); }
+            write!(f, "{byte}").unwrap();
+        }
+        writeln!(f, "],").unwrap();
     }
     writeln!(f, "];").unwrap();
     writeln!(f).unwrap();

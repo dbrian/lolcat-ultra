@@ -7,7 +7,21 @@ This project exists primarily to help me learn performance optimization in Rust.
 
 ## Performance
 
-We achive performance by moving work out of the hot path. At build time we precompute rainbow tables and ANSI sequences to avoid runtime formatting. At runtime we use fixed-point integer math in the hot path (no floating point operations per character).
+We achieve performance by moving work out of the hot path. At build time we precompute rainbow tables and ANSI sequences to avoid runtime formatting. At runtime we use fixed-point integer math in the hot path (no floating point operations per character), and process lines zero-copy from the read buffer where possible.
+
+### Current ceiling
+
+The benchmark pipes `yes "test line"` through `head -n 10000000` into lolcat-ultra:
+
+```
+yes "test line"  0.00s user  2% cpu   0.39s total
+head -n 10000000 0.39s user 99% cpu   0.39s total   ← pipeline floor
+lolcat-ultra -F  0.22s user 55% cpu   0.40s total
+```
+
+lolcat-ultra's **CPU time is 0.22s**, but wall time is 0.40s — it spends roughly half its time blocked waiting for `head` to write to the pipe. The pipeline floor is ~0.39s, set entirely by `head`'s throughput. lolcat-ultra cannot exit before `head` closes the pipe.
+
+The gap between the current 0.396s and the ~0.39s floor is about 6ms (~1.5%). That headroom is essentially noise: it represents the time to drain the last pipe buffer and flush output after `head` exits, not recoverable CPU work. Further optimization of the hot path will not move the benchmark needle.
 
 ## Building
 
@@ -54,6 +68,6 @@ $ time yes "test line" | head -n 10000000 | lolcat-ultra -F > /dev/null
 
 [ur0/lolcat](https://github.com/ur0/lolcat) - Another Rust port _(21.16s)_
 
-lolcat-ultra - Standard release build _(0.55s)_
+lolcat-ultra - Standard release build _(0.40s)_
 
-lolcat-ultra - PGO optimized build _(0.50s)_
+lolcat-ultra - PGO optimized build _(0.39s)_

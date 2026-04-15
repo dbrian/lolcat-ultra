@@ -42,11 +42,12 @@ impl RainbowLookup {
         (RAINBOW_TABLE[idx], idx)
     }
 
-    /// Get pre-built `TrueColor` ANSI sequence for a table index
+    /// Get pre-built `TrueColor` ANSI sequence for a table index.
+    /// Returns a 19-byte slice from the contiguous fixed-width table (no pointer indirection).
     #[inline(always)]
     #[must_use]
     pub fn get_truecolor_ansi(&self, idx: usize) -> &'static [u8] {
-        ANSI_TRUECOLOR_CACHE[idx]
+        &ANSI_TRUECOLOR_FIXED[idx][..19]
     }
 
     /// Get pre-computed 256-color code for a table index
