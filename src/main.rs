@@ -137,8 +137,7 @@ fn main() {
             }
         }
     } else {
-        let stdin = io::stdin();
-        let reader = stdin.lock();
+        let reader = BufReader::with_capacity(256 * 1024, io::stdin());
         lolcat_ultra::process_input(reader, &config)
     };
 

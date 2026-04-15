@@ -208,6 +208,11 @@ where
             if b == b'\t' {
                 i += 1;
                 for _ in 0..8 {
+                    // Flush before ANSI write; space (1 byte) always fits after
+                    if buf.remaining_capacity() < 32 {
+                        writer.write_all(&buf)?;
+                        buf.clear();
+                    }
                     let color_idx = lookup.color_index_from_phase(phase);
                     if last_color_idx != Some(color_idx) {
                         write_ansi(&mut buf, color_idx, lookup);
@@ -215,31 +220,28 @@ where
                     }
                     buf.push(b' ');
                     phase = phase.wrapping_add(phase_inc);
-                    maybe_flush(writer, &mut buf)?;
                 }
                 continue;
             }
 
-            // Only emit color on codepoint-start bytes to avoid splitting
-            // multi-byte UTF-8 sequences with ANSI escapes
+            // Codepoint-start bytes: flush if needed, emit color, advance phase.
+            // Continuation bytes (0x80–0xBF) just get pushed; headroom is guaranteed
+            // by the flush check on each start byte (max 19-byte ANSI + 4-byte codepoint < 32).
             if b < 0x80 || b >= 0xC0 {
+                if buf.remaining_capacity() < 32 {
+                    writer.write_all(&buf)?;
+                    buf.clear();
+                }
                 let color_idx = lookup.color_index_from_phase(phase);
                 if last_color_idx != Some(color_idx) {
                     write_ansi(&mut buf, color_idx, lookup);
                     last_color_idx = Some(color_idx);
                 }
-            }
-
-            // Copy byte to buffer
-            buf.push(b);
-            i += 1;
-
-            // Advance phase only on codepoint-start bytes
-            if b < 0x80 || b >= 0xC0 {
                 phase = phase.wrapping_add(phase_inc);
             }
 
-            maybe_flush(writer, &mut buf)?;
+            buf.push(b);
+            i += 1;
         }
     }
 
@@ -261,7 +263,7 @@ struct BatchProcessor<W: Write> {
 impl<W: Write> BatchProcessor<W> {
     fn new(writer: W, config: &Config) -> Self {
         // Use a larger buffer size for better performance with large files
-        const BUFFER_SIZE: usize = 64 * 1024; // 64KB buffer
+        const BUFFER_SIZE: usize = 256 * 1024; // 256KB buffer
         Self {
             writer: BufWriter::with_capacity(BUFFER_SIZE, writer),
             lookup: RainbowLookup::new(config.frequency),
