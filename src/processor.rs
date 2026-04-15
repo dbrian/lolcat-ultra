@@ -191,24 +191,80 @@ where
             }
         }
     } else {
-        while i < len {
-            let b = bytes[i];
+        // Fast path: short pure-ASCII lines with no ESC or tab (the common case).
+        // Each char needs at most 20 bytes (19-byte ANSI + 1-byte char).
+        // If the entire line fits in the buffer AND contains no special bytes,
+        // skip per-char ESC/tab/capacity/UTF-8 checks entirely.
+        let fits_in_buf = len <= (BUF_CAP - 2) / 20;
+        let no_special = fits_in_buf && !bytes.iter().any(|&b| b == 0x1b || b == b'\t');
+        let all_ascii = no_special && bytes.iter().all(|&b| b < 0x80);
 
-            if b == 0x1b {
-                // Flush accumulated buffer before ANSI escape
-                if !buf.is_empty() {
-                    writer.write_all(&buf)?;
-                    buf.clear();
+        if all_ascii {
+            // Tightest inner loop: pure ASCII, no special bytes, buffer won't fill.
+            // No ESC/tab/capacity/UTF-8 checks needed.
+            while i < len {
+                let color_idx = lookup.color_index_from_phase(phase);
+                if last_color_idx != Some(color_idx) {
+                    write_ansi(&mut buf, color_idx, lookup);
+                    last_color_idx = Some(color_idx);
                 }
-                i = process_ansi_escape_bytes(writer, bytes, i)?;
-                last_color_idx = None;
-                continue;
-            }
-
-            if b == b'\t' {
+                phase = phase.wrapping_add(phase_inc);
+                buf.push(bytes[i]);
                 i += 1;
-                for _ in 0..8 {
-                    // Flush before ANSI write; space (1 byte) always fits after
+            }
+        } else if no_special {
+            // ASCII + UTF-8 but no ESC/tab; no capacity check needed.
+            while i < len {
+                let b = bytes[i];
+                if b < 0x80 || b >= 0xC0 {
+                    let color_idx = lookup.color_index_from_phase(phase);
+                    if last_color_idx != Some(color_idx) {
+                        write_ansi(&mut buf, color_idx, lookup);
+                        last_color_idx = Some(color_idx);
+                    }
+                    phase = phase.wrapping_add(phase_inc);
+                }
+                buf.push(b);
+                i += 1;
+            }
+        } else {
+            while i < len {
+                let b = bytes[i];
+
+                if b == 0x1b {
+                    // Flush accumulated buffer before ANSI escape
+                    if !buf.is_empty() {
+                        writer.write_all(&buf)?;
+                        buf.clear();
+                    }
+                    i = process_ansi_escape_bytes(writer, bytes, i)?;
+                    last_color_idx = None;
+                    continue;
+                }
+
+                if b == b'\t' {
+                    i += 1;
+                    for _ in 0..8 {
+                        // Flush before ANSI write; space (1 byte) always fits after
+                        if buf.remaining_capacity() < 32 {
+                            writer.write_all(&buf)?;
+                            buf.clear();
+                        }
+                        let color_idx = lookup.color_index_from_phase(phase);
+                        if last_color_idx != Some(color_idx) {
+                            write_ansi(&mut buf, color_idx, lookup);
+                            last_color_idx = Some(color_idx);
+                        }
+                        buf.push(b' ');
+                        phase = phase.wrapping_add(phase_inc);
+                    }
+                    continue;
+                }
+
+                // Codepoint-start bytes: flush if needed, emit color, advance phase.
+                // Continuation bytes (0x80–0xBF) just get pushed; headroom is guaranteed
+                // by the flush check on each start byte (max 19-byte ANSI + 4-byte codepoint < 32).
+                if b < 0x80 || b >= 0xC0 {
                     if buf.remaining_capacity() < 32 {
                         writer.write_all(&buf)?;
                         buf.clear();
@@ -218,30 +274,12 @@ where
                         write_ansi(&mut buf, color_idx, lookup);
                         last_color_idx = Some(color_idx);
                     }
-                    buf.push(b' ');
                     phase = phase.wrapping_add(phase_inc);
                 }
-                continue;
-            }
 
-            // Codepoint-start bytes: flush if needed, emit color, advance phase.
-            // Continuation bytes (0x80–0xBF) just get pushed; headroom is guaranteed
-            // by the flush check on each start byte (max 19-byte ANSI + 4-byte codepoint < 32).
-            if b < 0x80 || b >= 0xC0 {
-                if buf.remaining_capacity() < 32 {
-                    writer.write_all(&buf)?;
-                    buf.clear();
-                }
-                let color_idx = lookup.color_index_from_phase(phase);
-                if last_color_idx != Some(color_idx) {
-                    write_ansi(&mut buf, color_idx, lookup);
-                    last_color_idx = Some(color_idx);
-                }
-                phase = phase.wrapping_add(phase_inc);
+                buf.push(b);
+                i += 1;
             }
-
-            buf.push(b);
-            i += 1;
         }
     }
 
