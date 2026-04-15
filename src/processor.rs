@@ -330,43 +330,60 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
 
     // Color processing path
     let mut processor = BatchProcessor::new(writer, config);
+    // line_buf is only used for the rare case where a line spans two buffer fills
     let mut line_buf: Vec<u8> = Vec::with_capacity(1024);
     let mut lines_read = 0;
 
     loop {
         if lines_read >= MAX_LINES {
-            // Safety limit reached - prevent unbounded processing
             break;
         }
 
-        line_buf.clear();
-        let n = reader
-            .read_until(b'\n', &mut line_buf)
-            .context("Failed to read line")?;
-        if n == 0 {
-            break;
-        }
-
-        // Trim trailing newline to match lines() behavior
-        let mut line_len = line_buf.len();
-        if line_buf.last() == Some(&b'\n') {
-            line_len -= 1;
-            if line_len > 0 && line_buf[line_len - 1] == b'\r' {
-                line_len -= 1;
+        // Fast path: process the line directly from the BufReader's internal buffer
+        // (zero copy for the common case where the full line is already buffered).
+        let (found, consumed) = {
+            let available = reader.fill_buf().context("Failed to read input")?;
+            if available.is_empty() {
+                break;
             }
+            if let Some(nl) = available.iter().position(|&b| b == b'\n') {
+                let before_nl = &available[..nl];
+                let line = if before_nl.last() == Some(&b'\r') {
+                    &before_nl[..before_nl.len() - 1]
+                } else {
+                    before_nl
+                };
+                let start_pos = (lines_read as f64) * config.spread + config.random_offset;
+                processor.process_line(line, start_pos, config, color_mode)?;
+                lines_read += 1;
+                (true, nl + 1)
+            } else {
+                (false, 0_usize)
+            }
+        };
+
+        if found {
+            reader.consume(consumed);
+        } else {
+            // Slow path: line spans a buffer boundary — fall back to read_until
+            line_buf.clear();
+            let n = reader
+                .read_until(b'\n', &mut line_buf)
+                .context("Failed to read line")?;
+            if n == 0 {
+                break;
+            }
+            let mut line_len = line_buf.len();
+            if line_buf.last() == Some(&b'\n') {
+                line_len -= 1;
+                if line_len > 0 && line_buf[line_len - 1] == b'\r' {
+                    line_len -= 1;
+                }
+            }
+            let start_pos = (lines_read as f64) * config.spread + config.random_offset;
+            processor.process_line(&line_buf[..line_len], start_pos, config, color_mode)?;
+            lines_read += 1;
         }
-        let line = &line_buf[..line_len];
-
-        // Calculate start position for this line
-        let start_pos = (lines_read as f64) * config.spread + config.random_offset;
-        debug_assert!(
-            start_pos.is_finite(),
-            "Calculated start position must be finite"
-        );
-
-        processor.process_line(line, start_pos, config, color_mode)?;
-
-        lines_read += 1;
     }
 
     processor.finish()
