@@ -24,7 +24,7 @@ fn get_ansi_256(code: u8) -> &'static [u8] {
 /// written to the underlying writer directly once the remaining space drops
 /// below `LINE_MARGIN`, so the common case does exactly one copy: tables
 /// into the buffer, buffer to the fd.
-const OUT_CAP: usize = 256 * 1024;
+const OUT_CAP: usize = 1024 * 1024;
 
 /// Guaranteed headroom at the start of each line (the caller flushes below
 /// this). Lines whose worst-case colored size fits in this margin take the
