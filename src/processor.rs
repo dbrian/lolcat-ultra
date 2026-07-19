@@ -600,7 +600,7 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write + Send>(
     // results back in dispatch order.
     const CHUNK: usize = 128 * 1024;
     let n_workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-    let n_workers = n_workers.min(8);
+    let n_workers = n_workers.min(6);
 
     // Phase bookkeeping, mirroring BatchProcessor::new
     let lookup = RainbowLookup::new(config.frequency);
