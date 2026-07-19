@@ -245,8 +245,15 @@ where
         // the padding slot). If the entire line fits in the buffer AND contains
         // no special bytes, skip per-char ESC/tab/capacity/UTF-8 checks entirely.
         let fits_in_buf = len <= (LINE_MARGIN - 24) / 20;
-        let no_special = fits_in_buf && !bytes.iter().any(|&b| b == 0x1b || b == b'\t');
-        let all_ascii = no_special && bytes.iter().all(|&b| b < 0x80);
+        // Single branchless pass classifying the line (vectorizes)
+        let mut has_special = false;
+        let mut has_non_ascii = false;
+        for &b in bytes {
+            has_special |= (b == 0x1b) | (b == b'\t');
+            has_non_ascii |= b >= 0x80;
+        }
+        let no_special = fits_in_buf && !has_special;
+        let all_ascii = no_special && !has_non_ascii;
 
         if all_ascii {
             // Tightest inner loop: pure ASCII, no special bytes, buffer won't fill.
