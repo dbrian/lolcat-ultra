@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
-use arrayvec::ArrayVec;
-use std::io::{self, BufRead, BufWriter, Write};
+use std::io::{self, BufRead, Write};
 
 use crate::ansi::process_ansi_escape_bytes;
 use crate::color::{ColorMode, detect_color_support};
@@ -21,73 +20,108 @@ fn get_ansi_256(code: u8) -> &'static [u8] {
     generated::ANSI_256_CACHE[code as usize]
 }
 
-/// Buffer capacity for line processing
-const BUF_CAP: usize = 8192;
+/// Capacity of the persistent output buffer. Lines accumulate here and are
+/// written to the underlying writer directly once the remaining space drops
+/// below `LINE_MARGIN`, so the common case does exactly one copy: tables
+/// into the buffer, buffer to the fd.
+const OUT_CAP: usize = 1024 * 1024;
 
-/// Helper to write ANSI TrueColor sequence to buffer
+/// Guaranteed headroom at the start of each line (the caller flushes below
+/// this). Lines whose worst-case colored size fits in this margin take the
+/// checkless fast paths.
+const LINE_MARGIN: usize = 8192;
+
+/// Flush margin for the unbounded-line paths: worst case appended between
+/// flush checks is a tab (8 colored spaces = 8 * 21 bytes) plus slack.
+const FLUSH_MARGIN: usize = 224;
+
+/// Write ANSI TrueColor sequence into `buf` at `j`.
+/// Returns the offset where the following character byte must be stored.
+/// Copies the full 20-byte fixed-width table entry (19 content bytes + 1
+/// padding byte) so the compiler emits a fixed-size copy; the padding slot
+/// at the returned offset is overwritten by the caller's character byte.
 #[inline(always)]
-fn write_ansi_truecolor(buf: &mut ArrayVec<u8, BUF_CAP>, color_idx: usize, lookup: &RainbowLookup) {
-    buf.try_extend_from_slice(lookup.get_truecolor_ansi(color_idx))
-        .unwrap();
+fn write_ansi_truecolor(
+    buf: &mut [u8; OUT_CAP],
+    j: usize,
+    color_idx: usize,
+    lookup: &RainbowLookup,
+) -> usize {
+    buf[j..j + 20].copy_from_slice(lookup.get_truecolor_ansi_fixed(color_idx));
+    j + 19
 }
 
-/// Helper to write ANSI 256-color sequence to buffer
+/// Write ANSI 256-color sequence into `buf` at `j`.
+/// Returns the offset where the following character byte must be stored.
 #[inline(always)]
-fn write_ansi_256color(buf: &mut ArrayVec<u8, BUF_CAP>, color_idx: usize, lookup: &RainbowLookup) {
-    let code = lookup.get_256_code(color_idx);
-    buf.try_extend_from_slice(get_ansi_256(code)).unwrap();
-}
-
-/// Flush buffer if getting close to capacity
-#[inline]
-fn maybe_flush<W: Write>(writer: &mut W, buf: &mut ArrayVec<u8, BUF_CAP>) -> io::Result<()> {
-    // Leave headroom for ANSI sequences + UTF-8 chars
-    if buf.remaining_capacity() < 64 {
-        writer.write_all(buf)?;
-        buf.clear();
-    }
-    Ok(())
+fn write_ansi_256color(
+    buf: &mut [u8; OUT_CAP],
+    j: usize,
+    color_idx: usize,
+    lookup: &RainbowLookup,
+) -> usize {
+    let seq = get_ansi_256(lookup.get_256_code(color_idx));
+    buf[j..j + seq.len()].copy_from_slice(seq);
+    j + seq.len()
 }
 
 /// Process a line with optimizations:
 /// - Pre-cached ANSI sequences (no itoa calls in hot loop)
-/// - Stack-allocated buffer (better cache locality)
+/// - Reused flat output buffer with index-based writes (no per-push bookkeeping)
 /// - Single final write (includes newline)
 /// - Track last color to avoid redundant ANSI sequences
 /// - Single color lookup per character
+/// Appends the colored line to `out` starting at cursor `j` and returns the
+/// new cursor. The caller guarantees at least `LINE_MARGIN` bytes of headroom
+/// at entry; oversized lines flush `out` to `writer` mid-line as needed.
 fn process_line_streaming<W: Write>(
     line: &[u8],
-    start_pos: f64,
-    config: &Config,
+    phase0: u64,
+    phase_inc: u64,
     color_mode: ColorMode,
     lookup: &RainbowLookup,
+    out: &mut [u8; OUT_CAP],
+    j: usize,
     writer: &mut W,
-) -> Result<()> {
-    debug_assert!(start_pos.is_finite(), "Start position must be finite");
-
+) -> Result<usize> {
     // Dispatch to monomorphic implementation based on color mode
     match color_mode {
         ColorMode::NoColor => {
-            // Fast path: no color processing needed
+            // Fast path: no color processing needed. Bypass the buffer since
+            // the line may be arbitrarily long.
+            if j > 0 {
+                writer
+                    .write_all(&out[..j])
+                    .context("Failed to flush before uncolored line")?;
+            }
             writer
                 .write_all(line)
                 .context("Failed to write line without color")?;
             writer
                 .write_all(b"\n")
                 .context("Failed to write newline without color")?;
-            Ok(())
+            Ok(0)
         }
-        ColorMode::TrueColor => process_line_with_color(
+        ColorMode::TrueColor => process_line_with_color::<_, _, true>(
             line,
-            start_pos,
-            config,
+            phase0,
+            phase_inc,
             lookup,
+            out,
+            j,
             writer,
             write_ansi_truecolor,
         ),
-        ColorMode::Color256 => {
-            process_line_with_color(line, start_pos, config, lookup, writer, write_ansi_256color)
-        }
+        ColorMode::Color256 => process_line_with_color::<_, _, false>(
+            line,
+            phase0,
+            phase_inc,
+            lookup,
+            out,
+            j,
+            writer,
+            write_ansi_256color,
+        ),
     }
 }
 
@@ -97,23 +131,22 @@ fn process_line_streaming<W: Write>(
 /// need detection (both single-byte ASCII). Multi-byte codepoints are copied as
 /// raw bytes; the phase counter advances only on codepoint-start bytes.
 #[inline]
-fn process_line_with_color<W: Write, F>(
+#[allow(clippy::too_many_arguments)]
+fn process_line_with_color<W: Write, F, const FIXED_ANSI: bool>(
     line: &[u8],
-    start_pos: f64,
-    config: &Config,
+    phase0: u64,
+    phase_inc: u64,
     lookup: &RainbowLookup,
+    out: &mut [u8; OUT_CAP],
+    j: usize,
     writer: &mut W,
     write_ansi: F,
-) -> Result<()>
+) -> Result<usize>
 where
-    F: Fn(&mut ArrayVec<u8, BUF_CAP>, usize, &RainbowLookup),
+    F: Fn(&mut [u8; OUT_CAP], usize, usize, &RainbowLookup) -> usize,
 {
-    // Stack-allocated buffer - 8KB for better cache locality
-    let mut buf = ArrayVec::<u8, BUF_CAP>::new();
-
-    // Fixed-point phase accumulator - eliminates all float ops in hot path
-    let pos_increment = 1.0 / config.spread;
-    let (mut phase, phase_inc) = lookup.fixedpoint_phase(start_pos, pos_increment);
+    // Fixed-point phase accumulator - no float ops anywhere in the hot path
+    let mut phase = phase0;
 
     // Track last color index to avoid redundant ANSI sequences
     let mut last_color_idx: Option<usize> = None;
@@ -121,6 +154,9 @@ where
     let bytes = line;
     let len = bytes.len();
     let mut i = 0;
+    // Write cursor into `out`. ANSI writers return the offset for the
+    // following character byte (overwriting the truecolor padding slot).
+    let mut j = j;
 
     // Optimization: if phase_inc is small, we can process chunks of characters
     // that share the same color index without recalculating it.
@@ -130,9 +166,9 @@ where
 
             if b == 0x1b {
                 // Flush accumulated buffer before ANSI escape
-                if !buf.is_empty() {
-                    writer.write_all(&buf)?;
-                    buf.clear();
+                if j > 0 {
+                    writer.write_all(&out[..j])?;
+                    j = 0;
                 }
                 i = process_ansi_escape_bytes(writer, bytes, i)?;
                 last_color_idx = None;
@@ -141,23 +177,31 @@ where
 
             if b == b'\t' {
                 i += 1;
+                if OUT_CAP - j < FLUSH_MARGIN {
+                    writer.write_all(&out[..j])?;
+                    j = 0;
+                }
                 for _ in 0..8 {
                     let color_idx = lookup.color_index_from_phase(phase);
                     if last_color_idx != Some(color_idx) {
-                        write_ansi(&mut buf, color_idx, lookup);
+                        j = write_ansi(out, j, color_idx, lookup);
                         last_color_idx = Some(color_idx);
                     }
-                    buf.push(b' ');
+                    out[j] = b' ';
+                    j += 1;
                     phase = phase.wrapping_add(phase_inc);
-                    maybe_flush(writer, &mut buf)?;
                 }
                 continue;
             }
 
             // Normal character batching
+            if OUT_CAP - j < FLUSH_MARGIN {
+                writer.write_all(&out[..j])?;
+                j = 0;
+            }
             let color_idx = lookup.color_index_from_phase(phase);
             if last_color_idx != Some(color_idx) {
-                write_ansi(&mut buf, color_idx, lookup);
+                j = write_ansi(out, j, color_idx, lookup);
                 last_color_idx = Some(color_idx);
             }
 
@@ -168,7 +212,9 @@ where
             // We must never break in the middle of a multi-byte UTF-8 sequence,
             // as that would allow an ANSI color code to be inserted between
             // the start byte and continuation bytes, corrupting the character.
-            while i < len && buf.remaining_capacity() >= 4 {
+            // The first iteration always writes (bytes[i] is a normal char and
+            // max_run >= 1), so the truecolor padding slot is always overwritten.
+            while i < len && OUT_CAP - j > 4 {
                 let b2 = bytes[i];
                 if b2 == 0x1b || b2 == b'\t' {
                     break;
@@ -181,51 +227,104 @@ where
                     }
                     processed += 1;
                 }
-                buf.push(b2);
+                out[j] = b2;
+                j += 1;
                 i += 1;
             }
 
             if processed > 0 {
                 phase = phase.wrapping_add(phase_inc.wrapping_mul(processed as u64));
-                maybe_flush(writer, &mut buf)?;
             }
         }
     } else {
         // Fast path: short pure-ASCII lines with no ESC or tab (the common case).
-        // Each char needs at most 20 bytes (19-byte ANSI + 1-byte char).
-        // If the entire line fits in the buffer AND contains no special bytes,
-        // skip per-char ESC/tab/capacity/UTF-8 checks entirely.
-        let fits_in_buf = len <= (BUF_CAP - 2) / 20;
-        let no_special = fits_in_buf && !bytes.iter().any(|&b| b == 0x1b || b == b'\t');
-        let all_ascii = no_special && bytes.iter().all(|&b| b < 0x80);
+        // Each char needs at most 20 bytes (19-byte ANSI + 1-byte char, sharing
+        // the padding slot). If the entire line fits in the buffer AND contains
+        // no special bytes, skip per-char ESC/tab/capacity/UTF-8 checks entirely.
+        let fits_in_buf = len <= (LINE_MARGIN - 24) / 20;
+        // Single branchless pass classifying the line (vectorizes)
+        let mut has_special = false;
+        let mut has_non_ascii = false;
+        for &b in bytes {
+            has_special |= (b == 0x1b) | (b == b'\t');
+            has_non_ascii |= b >= 0x80;
+        }
+        let no_special = fits_in_buf && !has_special;
+        let all_ascii = no_special && !has_non_ascii;
 
         if all_ascii {
             // Tightest inner loop: pure ASCII, no special bytes, buffer won't fill.
             // No ESC/tab/capacity/UTF-8 checks needed.
-            while i < len {
-                let color_idx = lookup.color_index_from_phase(phase);
-                if last_color_idx != Some(color_idx) {
-                    write_ansi(&mut buf, color_idx, lookup);
-                    last_color_idx = Some(color_idx);
+            if phase_inc >= (1 << 32) {
+                // The color index advances at least once per character, so the
+                // ANSI sequence always changes: emit unconditionally with no
+                // last-color tracking or branches.
+                if FIXED_ANSI {
+                    // TrueColor emits exactly 20 bytes per character (19-byte
+                    // sequence + the character in the padding slot). Slice the
+                    // destination once and iterate in exact 20-byte chunks:
+                    // no per-character bounds checks at all.
+                    let dst = &mut out[j..j + len * 20];
+                    for (chunk, &b) in dst.chunks_exact_mut(20).zip(bytes) {
+                        let color_idx = lookup.color_index_from_phase(phase);
+                        chunk.copy_from_slice(lookup.get_truecolor_ansi_fixed(color_idx));
+                        chunk[19] = b;
+                        phase = phase.wrapping_add(phase_inc);
+                    }
+                    j += len * 20;
+                } else {
+                    while i < len {
+                        let color_idx = lookup.color_index_from_phase(phase);
+                        j = write_ansi(out, j, color_idx, lookup);
+                        out[j] = bytes[i];
+                        j += 1;
+                        phase = phase.wrapping_add(phase_inc);
+                        i += 1;
+                    }
                 }
-                phase = phase.wrapping_add(phase_inc);
-                buf.push(bytes[i]);
-                i += 1;
-            }
-        } else if no_special {
-            // ASCII + UTF-8 but no ESC/tab; no capacity check needed.
-            while i < len {
-                let b = bytes[i];
-                if b < 0x80 || b >= 0xC0 {
+            } else {
+                while i < len {
                     let color_idx = lookup.color_index_from_phase(phase);
                     if last_color_idx != Some(color_idx) {
-                        write_ansi(&mut buf, color_idx, lookup);
+                        j = write_ansi(out, j, color_idx, lookup);
                         last_color_idx = Some(color_idx);
                     }
                     phase = phase.wrapping_add(phase_inc);
+                    out[j] = bytes[i];
+                    j += 1;
+                    i += 1;
                 }
-                buf.push(b);
-                i += 1;
+            }
+        } else if no_special {
+            // ASCII + UTF-8 but no ESC/tab; no capacity check needed.
+            if phase_inc >= (1 << 32) {
+                // Color index changes on every codepoint: emit unconditionally.
+                while i < len {
+                    let b = bytes[i];
+                    if b < 0x80 || b >= 0xC0 {
+                        let color_idx = lookup.color_index_from_phase(phase);
+                        j = write_ansi(out, j, color_idx, lookup);
+                        phase = phase.wrapping_add(phase_inc);
+                    }
+                    out[j] = b;
+                    j += 1;
+                    i += 1;
+                }
+            } else {
+                while i < len {
+                    let b = bytes[i];
+                    if b < 0x80 || b >= 0xC0 {
+                        let color_idx = lookup.color_index_from_phase(phase);
+                        if last_color_idx != Some(color_idx) {
+                            j = write_ansi(out, j, color_idx, lookup);
+                            last_color_idx = Some(color_idx);
+                        }
+                        phase = phase.wrapping_add(phase_inc);
+                    }
+                    out[j] = b;
+                    j += 1;
+                    i += 1;
+                }
             }
         } else {
             while i < len {
@@ -233,9 +332,9 @@ where
 
                 if b == 0x1b {
                     // Flush accumulated buffer before ANSI escape
-                    if !buf.is_empty() {
-                        writer.write_all(&buf)?;
-                        buf.clear();
+                    if j > 0 {
+                        writer.write_all(&out[..j])?;
+                        j = 0;
                     }
                     i = process_ansi_escape_bytes(writer, bytes, i)?;
                     last_color_idx = None;
@@ -244,18 +343,18 @@ where
 
                 if b == b'\t' {
                     i += 1;
+                    if OUT_CAP - j < FLUSH_MARGIN {
+                        writer.write_all(&out[..j])?;
+                        j = 0;
+                    }
                     for _ in 0..8 {
-                        // Flush before ANSI write; space (1 byte) always fits after
-                        if buf.remaining_capacity() < 32 {
-                            writer.write_all(&buf)?;
-                            buf.clear();
-                        }
                         let color_idx = lookup.color_index_from_phase(phase);
                         if last_color_idx != Some(color_idx) {
-                            write_ansi(&mut buf, color_idx, lookup);
+                            j = write_ansi(out, j, color_idx, lookup);
                             last_color_idx = Some(color_idx);
                         }
-                        buf.push(b' ');
+                        out[j] = b' ';
+                        j += 1;
                         phase = phase.wrapping_add(phase_inc);
                     }
                     continue;
@@ -263,74 +362,202 @@ where
 
                 // Codepoint-start bytes: flush if needed, emit color, advance phase.
                 // Continuation bytes (0x80–0xBF) just get pushed; headroom is guaranteed
-                // by the flush check on each start byte (max 19-byte ANSI + 4-byte codepoint < 32).
+                // by the flush check on each start byte (max 20-byte ANSI + 4-byte codepoint < 32).
                 if b < 0x80 || b >= 0xC0 {
-                    if buf.remaining_capacity() < 32 {
-                        writer.write_all(&buf)?;
-                        buf.clear();
+                    if OUT_CAP - j < 32 {
+                        writer.write_all(&out[..j])?;
+                        j = 0;
                     }
                     let color_idx = lookup.color_index_from_phase(phase);
                     if last_color_idx != Some(color_idx) {
-                        write_ansi(&mut buf, color_idx, lookup);
+                        j = write_ansi(out, j, color_idx, lookup);
                         last_color_idx = Some(color_idx);
                     }
                     phase = phase.wrapping_add(phase_inc);
                 }
 
-                buf.push(b);
+                out[j] = b;
+                j += 1;
                 i += 1;
             }
         }
     }
 
-    // Append newline and write in one syscall
-    buf.push(b'\n');
-    writer
-        .write_all(&buf)
-        .context("Failed to write final buffered line")?;
+    // Append newline; the accumulated output is flushed by the caller
+    out[j] = b'\n';
+    j += 1;
 
-    Ok(())
+    Ok(j)
 }
 
 /// Optimized batch processing for better performance with large inputs
 struct BatchProcessor<W: Write> {
-    writer: BufWriter<W>,
+    writer: W,
+    /// Persistent output buffer: lines accumulate here (index-based writes,
+    /// no per-push bookkeeping) and are written straight to the underlying
+    /// writer when headroom runs low — a single copy from tables to buffer.
+    out: Box<[u8; OUT_CAP]>,
+    /// Write cursor into `out`, carried across lines
+    j: usize,
+    /// Fixed-point phase at the start of the current line
+    phase: u64,
+    /// Fixed-point phase advance per line (spread positions)
+    line_phase_inc: u64,
+    /// Fixed-point phase advance per character
+    phase_inc: u64,
     lookup: RainbowLookup,
 }
 
 impl<W: Write> BatchProcessor<W> {
     fn new(writer: W, config: &Config) -> Self {
-        // Use a larger buffer size for better performance with large files
-        const BUFFER_SIZE: usize = 256 * 1024; // 256KB buffer
+        let lookup = RainbowLookup::new(config.frequency);
+        // All phase math is precomputed once: the line start phase advances
+        // incrementally by `line_phase_inc` per line instead of being derived
+        // from floats per line. The truncation drift versus exact per-line
+        // float math stays far below one table index over billions of lines.
+        let (phase, phase_inc) = lookup.fixedpoint_phase(config.random_offset, 1.0 / config.spread);
+        let (line_phase_inc, _) = lookup.fixedpoint_phase(config.spread, 1.0);
         Self {
-            writer: BufWriter::with_capacity(BUFFER_SIZE, writer),
-            lookup: RainbowLookup::new(config.frequency),
+            writer,
+            out: Box::new([0u8; OUT_CAP]),
+            j: 0,
+            phase,
+            line_phase_inc,
+            phase_inc,
+            lookup,
         }
     }
 
-    fn process_line(
+    /// Whether the fused clean-ASCII chunk path applies: TrueColor output and
+    /// a color index that advances on every character.
+    fn fused_chunk_eligible(&self, color_mode: ColorMode) -> bool {
+        color_mode == ColorMode::TrueColor && self.phase_inc >= (1 << 32)
+    }
+
+    /// Process every complete line of a pre-verified clean chunk (pure ASCII,
+    /// no ESC/tab/CR) with zero per-line classification or dispatch.
+    /// Returns (bytes consumed, lines processed), capped at `line_limit`.
+    fn process_clean_ascii_chunk(
         &mut self,
-        line: &[u8],
-        start_pos: f64,
-        config: &Config,
-        color_mode: ColorMode,
-    ) -> Result<()> {
-        process_line_streaming(
+        chunk: &[u8],
+        line_limit: usize,
+    ) -> Result<(usize, usize)> {
+        let mut j = self.j;
+        let mut phase_line = self.phase;
+        let mut offset = 0;
+        let mut lines = 0;
+        for nl in memchr::memchr_iter(b'\n', chunk) {
+            let line = &chunk[offset..nl];
+            if OUT_CAP - j < LINE_MARGIN {
+                self.writer
+                    .write_all(&self.out[..j])
+                    .context("Failed to write output batch")?;
+                j = 0;
+            }
+            if line.len() <= (LINE_MARGIN - 24) / 20 {
+                let mut phase = phase_line;
+                let dst = &mut self.out[j..j + line.len() * 20];
+                for (c, &b) in dst.chunks_exact_mut(20).zip(line) {
+                    let color_idx = self.lookup.color_index_from_phase(phase);
+                    c.copy_from_slice(self.lookup.get_truecolor_ansi_fixed(color_idx));
+                    c[19] = b;
+                    phase = phase.wrapping_add(self.phase_inc);
+                }
+                j += line.len() * 20;
+                self.out[j] = b'\n';
+                j += 1;
+            } else {
+                // Oversized line: the general path handles mid-line flushing
+                j = process_line_streaming(
+                    line,
+                    phase_line,
+                    self.phase_inc,
+                    ColorMode::TrueColor,
+                    &self.lookup,
+                    &mut self.out,
+                    j,
+                    &mut self.writer,
+                )?;
+            }
+            phase_line = phase_line.wrapping_add(self.line_phase_inc);
+            offset = nl + 1;
+            lines += 1;
+            if lines >= line_limit {
+                break;
+            }
+        }
+        self.j = j;
+        self.phase = phase_line;
+        Ok((offset, lines))
+    }
+
+    fn process_line(&mut self, line: &[u8], color_mode: ColorMode) -> Result<()> {
+        // Guarantee LINE_MARGIN headroom so short lines run checkless
+        if OUT_CAP - self.j < LINE_MARGIN {
+            self.writer
+                .write_all(&self.out[..self.j])
+                .context("Failed to write output batch")?;
+            self.j = 0;
+        }
+        self.j = process_line_streaming(
             line,
-            start_pos,
-            config,
+            self.phase,
+            self.phase_inc,
             color_mode,
             &self.lookup,
+            &mut self.out,
+            self.j,
             &mut self.writer,
         )?;
+        self.phase = self.phase.wrapping_add(self.line_phase_inc);
         Ok(())
     }
 
-    fn finish(mut self) -> Result<()> {
-        // Comprehensive terminal reset sequence
-        write!(self.writer, "\x1b[0m\x1b[39m\x1b[49m").context("Failed to write terminal reset")?;
-        self.writer.flush().context("Failed to flush final batch")
+    /// Process one dispatched job: every complete line in `chunk`, plus (for
+    /// the final chunk) any trailing bytes after the last newline as a last
+    /// line. Flushes all accumulated output to the writer before returning.
+    fn process_job(&mut self, chunk: &[u8], color_mode: ColorMode, is_final: bool) -> Result<()> {
+        let consumed = if self.fused_chunk_eligible(color_mode) && is_clean_ascii(chunk) {
+            self.process_clean_ascii_chunk(chunk, usize::MAX)?.0
+        } else {
+            let mut offset = 0;
+            for nl in memchr::memchr_iter(b'\n', chunk) {
+                let before_nl = &chunk[offset..nl];
+                let line = if before_nl.last() == Some(&b'\r') {
+                    &before_nl[..before_nl.len() - 1]
+                } else {
+                    before_nl
+                };
+                self.process_line(line, color_mode)?;
+                offset = nl + 1;
+            }
+            offset
+        };
+        if is_final && consumed < chunk.len() {
+            self.process_line(&chunk[consumed..], color_mode)?;
+        }
+        self.writer
+            .write_all(&self.out[..self.j])
+            .context("Failed to write job output")?;
+        self.j = 0;
+        Ok(())
     }
+}
+
+/// Whether the chunk is pure ASCII with no ESC, tab, or CR — eligible for the
+/// fused colorize path. Scans blockwise (branchless within a block, so it
+/// vectorizes) with early exit between blocks for quick rejection.
+fn is_clean_ascii(chunk: &[u8]) -> bool {
+    for block in chunk.chunks(1024) {
+        let mut dirty = false;
+        for &b in block {
+            dirty |= (b >= 0x80) | (b == 0x1b) | (b == b'\t') | (b == b'\r');
+        }
+        if dirty {
+            return false;
+        }
+    }
+    true
 }
 
 /// Process input with a specific color mode (for testing/benchmarking)
@@ -341,7 +568,7 @@ impl<W: Write> BatchProcessor<W> {
 /// - Reading from the input reader fails
 /// - Writing to the output writer fails
 /// - Maximum line limit is exceeded
-pub fn process_input_with_color_mode<R: BufRead, W: Write>(
+pub fn process_input_with_color_mode<R: BufRead, W: Write + Send>(
     mut reader: R,
     writer: W,
     config: &Config,
@@ -366,65 +593,120 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
         return Ok(());
     }
 
-    // Color processing path
-    let mut processor = BatchProcessor::new(writer, config);
-    // line_buf is only used for the rare case where a line spans two buffer fills
-    let mut line_buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut lines_read = 0;
+    // Color processing path: a parallel pipeline. The reader (this thread)
+    // assembles newline-aligned owned chunks and dispatches them round-robin
+    // to worker threads; each worker colorizes independently (a chunk's start
+    // phase is derived from the running line count); a writer thread writes
+    // results back in dispatch order.
+    const CHUNK: usize = 128 * 1024;
+    let n_workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    let n_workers = n_workers.min(6);
 
-    loop {
-        if lines_read >= MAX_LINES {
-            break;
+    // Phase bookkeeping, mirroring BatchProcessor::new
+    let lookup = RainbowLookup::new(config.frequency);
+    let (mut phase, _) = lookup.fixedpoint_phase(config.random_offset, 1.0 / config.spread);
+    let (line_delta, _) = lookup.fixedpoint_phase(config.spread, 1.0);
+
+    std::thread::scope(|s| -> Result<()> {
+        use std::sync::mpsc::sync_channel;
+
+        // Tickets carry the dispatch order (worker index per chunk) so the
+        // writer can reassemble the output stream in order.
+        let (ticket_tx, ticket_rx) = sync_channel::<usize>(4 * n_workers);
+        let mut job_txs = Vec::with_capacity(n_workers);
+        let mut out_rxs = Vec::with_capacity(n_workers);
+        let mut recycle_txs = Vec::with_capacity(n_workers);
+        let mut worker_handles = Vec::with_capacity(n_workers);
+
+        for _ in 0..n_workers {
+            let (job_tx, job_rx) = sync_channel::<(Vec<u8>, u64, bool)>(2);
+            let (out_tx, out_rx) = sync_channel::<Vec<u8>>(2);
+            let (recycle_tx, recycle_rx) = sync_channel::<Vec<u8>>(4);
+            job_txs.push(job_tx);
+            out_rxs.push(out_rx);
+            recycle_txs.push(recycle_tx);
+            worker_handles.push(s.spawn(move || -> Result<()> {
+                let mut proc = BatchProcessor::new(Vec::<u8>::new(), config);
+                while let Ok((chunk, chunk_phase, is_final)) = job_rx.recv() {
+                    let mut out_buf = recycle_rx.try_recv().unwrap_or_default();
+                    out_buf.clear();
+                    proc.writer = out_buf;
+                    proc.phase = chunk_phase;
+                    proc.process_job(&chunk, color_mode, is_final)?;
+                    if out_tx.send(std::mem::take(&mut proc.writer)).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            }));
         }
 
-        // Fast path: process the line directly from the BufReader's internal buffer
-        // (zero copy for the common case where the full line is already buffered).
-        let (found, consumed) = {
-            let available = reader.fill_buf().context("Failed to read input")?;
-            if available.is_empty() {
-                break;
+        let writer_handle = s.spawn(move || -> Result<()> {
+            let mut writer = writer;
+            while let Ok(i) = ticket_rx.recv() {
+                let Ok(buf) = out_rxs[i].recv() else { break };
+                writer.write_all(&buf).context("Failed to write output")?;
+                let _ = recycle_txs[i].try_send(buf);
             }
-            if let Some(nl) = available.iter().position(|&b| b == b'\n') {
-                let before_nl = &available[..nl];
-                let line = if before_nl.last() == Some(&b'\r') {
-                    &before_nl[..before_nl.len() - 1]
-                } else {
-                    before_nl
-                };
-                let start_pos = (lines_read as f64) * config.spread + config.random_offset;
-                processor.process_line(line, start_pos, config, color_mode)?;
-                lines_read += 1;
-                (true, nl + 1)
-            } else {
-                (false, 0_usize)
-            }
-        };
+            // Comprehensive terminal reset sequence
+            writer
+                .write_all(b"\x1b[0m\x1b[39m\x1b[49m")
+                .context("Failed to write terminal reset")?;
+            writer.flush().context("Failed to flush output")
+        });
 
-        if found {
-            reader.consume(consumed);
-        } else {
-            // Slow path: line spans a buffer boundary — fall back to read_until
-            line_buf.clear();
-            let n = reader
-                .read_until(b'\n', &mut line_buf)
-                .context("Failed to read line")?;
-            if n == 0 {
+        // Reader / dispatcher. `pending` grows until it holds at least CHUNK
+        // bytes and ends can be split at its last newline; the tail carries
+        // over to the next chunk so chunks stay newline-aligned.
+        let mut pending: Vec<u8> = Vec::with_capacity(CHUNK + 4096);
+        let mut k = 0usize;
+        let mut lines_read = 0usize;
+        loop {
+            if lines_read >= MAX_LINES {
                 break;
             }
-            let mut line_len = line_buf.len();
-            if line_buf.last() == Some(&b'\n') {
-                line_len -= 1;
-                if line_len > 0 && line_buf[line_len - 1] == b'\r' {
-                    line_len -= 1;
+            let data = reader.fill_buf().context("Failed to read input")?;
+            if data.is_empty() {
+                break;
+            }
+            let take = data.len();
+            pending.extend_from_slice(data);
+            reader.consume(take);
+            if pending.len() >= CHUNK {
+                if let Some(pos) = memchr::memrchr(b'\n', &pending) {
+                    let rest = pending.split_off(pos + 1);
+                    let chunk = std::mem::replace(&mut pending, rest);
+                    let lines = memchr::memchr_iter(b'\n', &chunk).count();
+                    if ticket_tx.send(k % n_workers).is_err() {
+                        break;
+                    }
+                    if job_txs[k % n_workers].send((chunk, phase, false)).is_err() {
+                        break;
+                    }
+                    phase = phase.wrapping_add(line_delta.wrapping_mul(lines as u64));
+                    lines_read += lines;
+                    k += 1;
                 }
             }
-            let start_pos = (lines_read as f64) * config.spread + config.random_offset;
-            processor.process_line(&line_buf[..line_len], start_pos, config, color_mode)?;
-            lines_read += 1;
         }
-    }
+        if !pending.is_empty() && lines_read < MAX_LINES {
+            let _ = ticket_tx.send(k % n_workers);
+            let _ = job_txs[k % n_workers].send((pending, phase, true));
+        }
+        drop(job_txs);
+        drop(ticket_tx);
 
-    processor.finish()
+        for handle in worker_handles {
+            match handle.join() {
+                Ok(result) => result?,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        match writer_handle.join() {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
 }
 
 /// Process input from a reader, applying rainbow colors to each line, writing to a custom writer
@@ -437,7 +719,7 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
 /// - Reading from the input reader fails
 /// - Writing to the output writer fails
 /// - Maximum line limit is exceeded
-pub fn process_input_to_writer<R: BufRead, W: Write>(
+pub fn process_input_to_writer<R: BufRead, W: Write + Send>(
     reader: R,
     writer: W,
     config: &Config,
@@ -455,7 +737,8 @@ pub fn process_input_to_writer<R: BufRead, W: Write>(
 /// - Writing to stdout fails
 /// - Maximum line limit is exceeded
 pub fn process_input<R: BufRead>(reader: R, config: &Config) -> Result<()> {
-    let stdout = io::stdout().lock();
+    // Stdout (not StdoutLock) so the writer can move to the writer thread
+    let stdout = io::stdout();
     process_input_to_writer(reader, stdout, config)
 }
 

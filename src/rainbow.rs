@@ -50,6 +50,16 @@ impl RainbowLookup {
         &ANSI_TRUECOLOR_FIXED[idx][..19]
     }
 
+    /// Get the full fixed-width `TrueColor` ANSI table entry for a table index:
+    /// 19 content bytes plus one padding byte. Copying all 20 bytes lets the
+    /// compiler emit a fixed-size copy; the padding byte is meant to be
+    /// overwritten by the character that follows the sequence.
+    #[inline(always)]
+    #[must_use]
+    pub fn get_truecolor_ansi_fixed(&self, idx: usize) -> &'static [u8; 20] {
+        &ANSI_TRUECOLOR_FIXED[idx]
+    }
+
     /// Get pre-computed 256-color code for a table index
     #[inline(always)]
     #[must_use]
