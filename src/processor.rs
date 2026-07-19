@@ -300,19 +300,34 @@ where
             }
         } else if no_special {
             // ASCII + UTF-8 but no ESC/tab; no capacity check needed.
-            while i < len {
-                let b = bytes[i];
-                if b < 0x80 || b >= 0xC0 {
-                    let color_idx = lookup.color_index_from_phase(phase);
-                    if last_color_idx != Some(color_idx) {
+            if phase_inc >= (1 << 32) {
+                // Color index changes on every codepoint: emit unconditionally.
+                while i < len {
+                    let b = bytes[i];
+                    if b < 0x80 || b >= 0xC0 {
+                        let color_idx = lookup.color_index_from_phase(phase);
                         j = write_ansi(out, j, color_idx, lookup);
-                        last_color_idx = Some(color_idx);
+                        phase = phase.wrapping_add(phase_inc);
                     }
-                    phase = phase.wrapping_add(phase_inc);
+                    out[j] = b;
+                    j += 1;
+                    i += 1;
                 }
-                out[j] = b;
-                j += 1;
-                i += 1;
+            } else {
+                while i < len {
+                    let b = bytes[i];
+                    if b < 0x80 || b >= 0xC0 {
+                        let color_idx = lookup.color_index_from_phase(phase);
+                        if last_color_idx != Some(color_idx) {
+                            j = write_ansi(out, j, color_idx, lookup);
+                            last_color_idx = Some(color_idx);
+                        }
+                        phase = phase.wrapping_add(phase_inc);
+                    }
+                    out[j] = b;
+                    j += 1;
+                    i += 1;
+                }
             }
         } else {
             while i < len {
