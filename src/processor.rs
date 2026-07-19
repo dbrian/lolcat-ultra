@@ -513,15 +513,34 @@ impl<W: Write> BatchProcessor<W> {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<()> {
+    /// Process one dispatched job: every complete line in `chunk`, plus (for
+    /// the final chunk) any trailing bytes after the last newline as a last
+    /// line. Flushes all accumulated output to the writer before returning.
+    fn process_job(&mut self, chunk: &[u8], color_mode: ColorMode, is_final: bool) -> Result<()> {
+        let consumed = if self.fused_chunk_eligible(color_mode) && is_clean_ascii(chunk) {
+            self.process_clean_ascii_chunk(chunk, usize::MAX)?.0
+        } else {
+            let mut offset = 0;
+            for nl in memchr::memchr_iter(b'\n', chunk) {
+                let before_nl = &chunk[offset..nl];
+                let line = if before_nl.last() == Some(&b'\r') {
+                    &before_nl[..before_nl.len() - 1]
+                } else {
+                    before_nl
+                };
+                self.process_line(line, color_mode)?;
+                offset = nl + 1;
+            }
+            offset
+        };
+        if is_final && consumed < chunk.len() {
+            self.process_line(&chunk[consumed..], color_mode)?;
+        }
         self.writer
             .write_all(&self.out[..self.j])
-            .context("Failed to write final batch")?;
-        // Comprehensive terminal reset sequence
-        self.writer
-            .write_all(b"\x1b[0m\x1b[39m\x1b[49m")
-            .context("Failed to write terminal reset")?;
-        self.writer.flush().context("Failed to flush final batch")
+            .context("Failed to write job output")?;
+        self.j = 0;
+        Ok(())
     }
 }
 
@@ -549,7 +568,7 @@ fn is_clean_ascii(chunk: &[u8]) -> bool {
 /// - Reading from the input reader fails
 /// - Writing to the output writer fails
 /// - Maximum line limit is exceeded
-pub fn process_input_with_color_mode<R: BufRead, W: Write>(
+pub fn process_input_with_color_mode<R: BufRead, W: Write + Send>(
     mut reader: R,
     writer: W,
     config: &Config,
@@ -574,74 +593,120 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
         return Ok(());
     }
 
-    // Color processing path
-    let mut processor = BatchProcessor::new(writer, config);
-    // line_buf is only used for the rare case where a line spans two buffer fills
-    let mut line_buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut lines_read = 0;
+    // Color processing path: a parallel pipeline. The reader (this thread)
+    // assembles newline-aligned owned chunks and dispatches them round-robin
+    // to worker threads; each worker colorizes independently (a chunk's start
+    // phase is derived from the running line count); a writer thread writes
+    // results back in dispatch order.
+    const CHUNK: usize = 256 * 1024;
+    let n_workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    let n_workers = n_workers.min(8);
 
-    loop {
-        if lines_read >= MAX_LINES {
-            break;
-        }
+    // Phase bookkeeping, mirroring BatchProcessor::new
+    let lookup = RainbowLookup::new(config.frequency);
+    let (mut phase, _) = lookup.fixedpoint_phase(config.random_offset, 1.0 / config.spread);
+    let (line_delta, _) = lookup.fixedpoint_phase(config.spread, 1.0);
 
-        // Fast path: process every complete line in the reader's buffer
-        // (zero copy), finding newlines with a single SIMD scan per chunk
-        // and consuming the chunk once.
-        let consumed = {
-            let available = reader.fill_buf().context("Failed to read input")?;
-            if available.is_empty() {
-                break;
-            }
-            if processor.fused_chunk_eligible(color_mode) && is_clean_ascii(available) {
-                let (consumed, lines) =
-                    processor.process_clean_ascii_chunk(available, MAX_LINES - lines_read)?;
-                lines_read += lines;
-                consumed
-            } else {
-                let mut offset = 0;
-                for nl in memchr::memchr_iter(b'\n', available) {
-                    let before_nl = &available[offset..nl];
-                    let line = if before_nl.last() == Some(&b'\r') {
-                        &before_nl[..before_nl.len() - 1]
-                    } else {
-                        before_nl
-                    };
-                    processor.process_line(line, color_mode)?;
-                    lines_read += 1;
-                    offset = nl + 1;
-                    if lines_read >= MAX_LINES {
+    std::thread::scope(|s| -> Result<()> {
+        use std::sync::mpsc::sync_channel;
+
+        // Tickets carry the dispatch order (worker index per chunk) so the
+        // writer can reassemble the output stream in order.
+        let (ticket_tx, ticket_rx) = sync_channel::<usize>(4 * n_workers);
+        let mut job_txs = Vec::with_capacity(n_workers);
+        let mut out_rxs = Vec::with_capacity(n_workers);
+        let mut recycle_txs = Vec::with_capacity(n_workers);
+        let mut worker_handles = Vec::with_capacity(n_workers);
+
+        for _ in 0..n_workers {
+            let (job_tx, job_rx) = sync_channel::<(Vec<u8>, u64, bool)>(2);
+            let (out_tx, out_rx) = sync_channel::<Vec<u8>>(2);
+            let (recycle_tx, recycle_rx) = sync_channel::<Vec<u8>>(4);
+            job_txs.push(job_tx);
+            out_rxs.push(out_rx);
+            recycle_txs.push(recycle_tx);
+            worker_handles.push(s.spawn(move || -> Result<()> {
+                let mut proc = BatchProcessor::new(Vec::<u8>::new(), config);
+                while let Ok((chunk, chunk_phase, is_final)) = job_rx.recv() {
+                    let mut out_buf = recycle_rx.try_recv().unwrap_or_default();
+                    out_buf.clear();
+                    proc.writer = out_buf;
+                    proc.phase = chunk_phase;
+                    proc.process_job(&chunk, color_mode, is_final)?;
+                    if out_tx.send(std::mem::take(&mut proc.writer)).is_err() {
                         break;
                     }
                 }
-                offset
-            }
-        };
+                Ok(())
+            }));
+        }
 
-        if consumed > 0 {
-            reader.consume(consumed);
-        } else {
-            // Slow path: line spans a buffer boundary — fall back to read_until
-            line_buf.clear();
-            let n = reader
-                .read_until(b'\n', &mut line_buf)
-                .context("Failed to read line")?;
-            if n == 0 {
+        let writer_handle = s.spawn(move || -> Result<()> {
+            let mut writer = writer;
+            while let Ok(i) = ticket_rx.recv() {
+                let Ok(buf) = out_rxs[i].recv() else { break };
+                writer.write_all(&buf).context("Failed to write output")?;
+                let _ = recycle_txs[i].try_send(buf);
+            }
+            // Comprehensive terminal reset sequence
+            writer
+                .write_all(b"\x1b[0m\x1b[39m\x1b[49m")
+                .context("Failed to write terminal reset")?;
+            writer.flush().context("Failed to flush output")
+        });
+
+        // Reader / dispatcher. `pending` grows until it holds at least CHUNK
+        // bytes and ends can be split at its last newline; the tail carries
+        // over to the next chunk so chunks stay newline-aligned.
+        let mut pending: Vec<u8> = Vec::with_capacity(CHUNK + 4096);
+        let mut k = 0usize;
+        let mut lines_read = 0usize;
+        loop {
+            if lines_read >= MAX_LINES {
                 break;
             }
-            let mut line_len = line_buf.len();
-            if line_buf.last() == Some(&b'\n') {
-                line_len -= 1;
-                if line_len > 0 && line_buf[line_len - 1] == b'\r' {
-                    line_len -= 1;
+            let data = reader.fill_buf().context("Failed to read input")?;
+            if data.is_empty() {
+                break;
+            }
+            let take = data.len();
+            pending.extend_from_slice(data);
+            reader.consume(take);
+            if pending.len() >= CHUNK {
+                if let Some(pos) = memchr::memrchr(b'\n', &pending) {
+                    let rest = pending.split_off(pos + 1);
+                    let chunk = std::mem::replace(&mut pending, rest);
+                    let lines = memchr::memchr_iter(b'\n', &chunk).count();
+                    if ticket_tx.send(k % n_workers).is_err() {
+                        break;
+                    }
+                    if job_txs[k % n_workers].send((chunk, phase, false)).is_err() {
+                        break;
+                    }
+                    phase = phase.wrapping_add(line_delta.wrapping_mul(lines as u64));
+                    lines_read += lines;
+                    k += 1;
                 }
             }
-            processor.process_line(&line_buf[..line_len], color_mode)?;
-            lines_read += 1;
         }
-    }
+        if !pending.is_empty() && lines_read < MAX_LINES {
+            let _ = ticket_tx.send(k % n_workers);
+            let _ = job_txs[k % n_workers].send((pending, phase, true));
+        }
+        drop(job_txs);
+        drop(ticket_tx);
 
-    processor.finish()
+        for handle in worker_handles {
+            match handle.join() {
+                Ok(result) => result?,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        match writer_handle.join() {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
 }
 
 /// Process input from a reader, applying rainbow colors to each line, writing to a custom writer
@@ -654,7 +719,7 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
 /// - Reading from the input reader fails
 /// - Writing to the output writer fails
 /// - Maximum line limit is exceeded
-pub fn process_input_to_writer<R: BufRead, W: Write>(
+pub fn process_input_to_writer<R: BufRead, W: Write + Send>(
     reader: R,
     writer: W,
     config: &Config,
@@ -672,7 +737,8 @@ pub fn process_input_to_writer<R: BufRead, W: Write>(
 /// - Writing to stdout fails
 /// - Maximum line limit is exceeded
 pub fn process_input<R: BufRead>(reader: R, config: &Config) -> Result<()> {
-    let stdout = io::stdout().lock();
+    // Stdout (not StdoutLock) so the writer can move to the writer thread
+    let stdout = io::stdout();
     process_input_to_writer(reader, stdout, config)
 }
 
