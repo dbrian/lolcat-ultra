@@ -104,7 +104,7 @@ fn process_line_streaming<W: Write>(
                 .context("Failed to write newline without color")?;
             Ok(0)
         }
-        ColorMode::TrueColor => process_line_with_color(
+        ColorMode::TrueColor => process_line_with_color::<_, _, true>(
             line,
             start_pos,
             config,
@@ -114,7 +114,7 @@ fn process_line_streaming<W: Write>(
             writer,
             write_ansi_truecolor,
         ),
-        ColorMode::Color256 => process_line_with_color(
+        ColorMode::Color256 => process_line_with_color::<_, _, false>(
             line,
             start_pos,
             config,
@@ -134,7 +134,7 @@ fn process_line_streaming<W: Write>(
 /// raw bytes; the phase counter advances only on codepoint-start bytes.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn process_line_with_color<W: Write, F>(
+fn process_line_with_color<W: Write, F, const FIXED_ANSI: bool>(
     line: &[u8],
     start_pos: f64,
     config: &Config,
@@ -255,13 +255,28 @@ where
                 // The color index advances at least once per character, so the
                 // ANSI sequence always changes: emit unconditionally with no
                 // last-color tracking or branches.
-                while i < len {
-                    let color_idx = lookup.color_index_from_phase(phase);
-                    j = write_ansi(out, j, color_idx, lookup);
-                    out[j] = bytes[i];
-                    j += 1;
-                    phase = phase.wrapping_add(phase_inc);
-                    i += 1;
+                if FIXED_ANSI {
+                    // TrueColor emits exactly 20 bytes per character (19-byte
+                    // sequence + the character in the padding slot). Slice the
+                    // destination once and iterate in exact 20-byte chunks:
+                    // no per-character bounds checks at all.
+                    let dst = &mut out[j..j + len * 20];
+                    for (chunk, &b) in dst.chunks_exact_mut(20).zip(bytes) {
+                        let color_idx = lookup.color_index_from_phase(phase);
+                        chunk.copy_from_slice(lookup.get_truecolor_ansi_fixed(color_idx));
+                        chunk[19] = b;
+                        phase = phase.wrapping_add(phase_inc);
+                    }
+                    j += len * 20;
+                } else {
+                    while i < len {
+                        let color_idx = lookup.color_index_from_phase(phase);
+                        j = write_ansi(out, j, color_idx, lookup);
+                        out[j] = bytes[i];
+                        j += 1;
+                        phase = phase.wrapping_add(phase_inc);
+                        i += 1;
+                    }
                 }
             } else {
                 while i < len {
