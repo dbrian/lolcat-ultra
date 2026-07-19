@@ -598,7 +598,7 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write + Send>(
     // to worker threads; each worker colorizes independently (a chunk's start
     // phase is derived from the running line count); a writer thread writes
     // results back in dispatch order.
-    const CHUNK: usize = 256 * 1024;
+    const CHUNK: usize = 128 * 1024;
     let n_workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let n_workers = n_workers.min(8);
 
