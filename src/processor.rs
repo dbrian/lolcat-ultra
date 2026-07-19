@@ -427,15 +427,17 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
             break;
         }
 
-        // Fast path: process the line directly from the BufReader's internal buffer
-        // (zero copy for the common case where the full line is already buffered).
-        let (found, consumed) = {
+        // Fast path: process every complete line in the reader's buffer
+        // (zero copy), finding newlines with a single SIMD scan per chunk
+        // and consuming the chunk once.
+        let consumed = {
             let available = reader.fill_buf().context("Failed to read input")?;
             if available.is_empty() {
                 break;
             }
-            if let Some(nl) = available.iter().position(|&b| b == b'\n') {
-                let before_nl = &available[..nl];
+            let mut offset = 0;
+            for nl in memchr::memchr_iter(b'\n', available) {
+                let before_nl = &available[offset..nl];
                 let line = if before_nl.last() == Some(&b'\r') {
                     &before_nl[..before_nl.len() - 1]
                 } else {
@@ -444,13 +446,15 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
                 let start_pos = (lines_read as f64) * config.spread + config.random_offset;
                 processor.process_line(line, start_pos, config, color_mode)?;
                 lines_read += 1;
-                (true, nl + 1)
-            } else {
-                (false, 0_usize)
+                offset = nl + 1;
+                if lines_read >= MAX_LINES {
+                    break;
+                }
             }
+            offset
         };
 
-        if found {
+        if consumed > 0 {
             reader.consume(consumed);
         } else {
             // Slow path: line spans a buffer boundary — fall back to read_until

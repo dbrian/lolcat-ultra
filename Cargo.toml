@@ -42,6 +42,7 @@ strip = false
 anyhow = "1.0"
 arrayvec = "0.7"
 itoa = "1.0"
+memchr = "2.8.3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
