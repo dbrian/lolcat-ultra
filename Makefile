@@ -1,4 +1,4 @@
-.PHONY: build pgo-build pgo-clean pgo-instrument pgo-profile pgo-optimize benchmark help
+.PHONY: build pgo-build pgo-clean pgo-instrument pgo-profile pgo-optimize benchmark bench help
 
 # Default target
 help:
@@ -9,7 +9,8 @@ help:
 	@echo "  pgo-instrument- Build with profiling instrumentation"
 	@echo "  pgo-profile   - Run workload to generate profile data"
 	@echo "  pgo-optimize  - Build optimized binary using profile data"
-	@echo "  benchmark     - Run performance benchmark"
+	@echo "  benchmark     - Run legacy pipe benchmark (producer-bound; kept for history)"
+	@echo "  bench         - Run file-input throughput benchmark vs Ruby lolcat"
 	@echo "  clean         - Clean cargo build artifacts"
 
 # Paths
@@ -51,10 +52,16 @@ pgo-optimize:
 	cargo clean
 	RUSTFLAGS="-Cprofile-use=$(MERGED_PROFILE)" cargo build --release
 
-# Run performance benchmark
+# Legacy pipe benchmark. Producer-bound: `head` caps the pipeline at ~0.39s,
+# so lolcat-ultra improvements do not move this number. Use `make bench` instead.
 benchmark:
-	@echo "Running benchmark..."
+	@echo "Running legacy pipe benchmark (producer-bound)..."
 	time yes "test line" | head -n 10000000 | ./target/release/lolcat-ultra -F > /dev/null
+
+# File-input throughput benchmark: measures lolcat-ultra itself (no pipe
+# producer) and normalizes to lines/s + MB/s for comparison with Ruby lolcat.
+bench: build
+	./bench/compare.sh
 
 # Clean cargo artifacts only
 clean:
