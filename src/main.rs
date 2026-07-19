@@ -128,7 +128,7 @@ fn main() {
     let result = if let Some(path) = args.input {
         match std::fs::File::open(&path) {
             Ok(file) => {
-                let reader = BufReader::new(file);
+                let reader = BufReader::with_capacity(64 * 1024, file);
                 lolcat_ultra::process_input(reader, &config)
             }
             Err(e) => {
