@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::io::{self, BufRead, BufWriter, Write};
+use std::io::{self, BufRead, Write};
 
 use crate::ansi::process_ansi_escape_bytes;
 use crate::color::{ColorMode, detect_color_support};
@@ -20,8 +20,16 @@ fn get_ansi_256(code: u8) -> &'static [u8] {
     generated::ANSI_256_CACHE[code as usize]
 }
 
-/// Buffer capacity for line processing
-const BUF_CAP: usize = 8192;
+/// Capacity of the persistent output buffer. Lines accumulate here and are
+/// written to the underlying writer directly once the remaining space drops
+/// below `LINE_MARGIN`, so the common case does exactly one copy: tables
+/// into the buffer, buffer to the fd.
+const OUT_CAP: usize = 256 * 1024;
+
+/// Guaranteed headroom at the start of each line (the caller flushes below
+/// this). Lines whose worst-case colored size fits in this margin take the
+/// checkless fast paths.
+const LINE_MARGIN: usize = 8192;
 
 /// Flush margin for the unbounded-line paths: worst case appended between
 /// flush checks is a tab (8 colored spaces = 8 * 21 bytes) plus slack.
@@ -34,7 +42,7 @@ const FLUSH_MARGIN: usize = 224;
 /// at the returned offset is overwritten by the caller's character byte.
 #[inline(always)]
 fn write_ansi_truecolor(
-    buf: &mut [u8; BUF_CAP],
+    buf: &mut [u8; OUT_CAP],
     j: usize,
     color_idx: usize,
     lookup: &RainbowLookup,
@@ -47,7 +55,7 @@ fn write_ansi_truecolor(
 /// Returns the offset where the following character byte must be stored.
 #[inline(always)]
 fn write_ansi_256color(
-    buf: &mut [u8; BUF_CAP],
+    buf: &mut [u8; OUT_CAP],
     j: usize,
     color_idx: usize,
     lookup: &RainbowLookup,
@@ -63,28 +71,38 @@ fn write_ansi_256color(
 /// - Single final write (includes newline)
 /// - Track last color to avoid redundant ANSI sequences
 /// - Single color lookup per character
+/// Appends the colored line to `out` starting at cursor `j` and returns the
+/// new cursor. The caller guarantees at least `LINE_MARGIN` bytes of headroom
+/// at entry; oversized lines flush `out` to `writer` mid-line as needed.
 fn process_line_streaming<W: Write>(
     line: &[u8],
     start_pos: f64,
     config: &Config,
     color_mode: ColorMode,
     lookup: &RainbowLookup,
-    out: &mut [u8; BUF_CAP],
+    out: &mut [u8; OUT_CAP],
+    j: usize,
     writer: &mut W,
-) -> Result<()> {
+) -> Result<usize> {
     debug_assert!(start_pos.is_finite(), "Start position must be finite");
 
     // Dispatch to monomorphic implementation based on color mode
     match color_mode {
         ColorMode::NoColor => {
-            // Fast path: no color processing needed
+            // Fast path: no color processing needed. Bypass the buffer since
+            // the line may be arbitrarily long.
+            if j > 0 {
+                writer
+                    .write_all(&out[..j])
+                    .context("Failed to flush before uncolored line")?;
+            }
             writer
                 .write_all(line)
                 .context("Failed to write line without color")?;
             writer
                 .write_all(b"\n")
                 .context("Failed to write newline without color")?;
-            Ok(())
+            Ok(0)
         }
         ColorMode::TrueColor => process_line_with_color(
             line,
@@ -92,6 +110,7 @@ fn process_line_streaming<W: Write>(
             config,
             lookup,
             out,
+            j,
             writer,
             write_ansi_truecolor,
         ),
@@ -101,6 +120,7 @@ fn process_line_streaming<W: Write>(
             config,
             lookup,
             out,
+            j,
             writer,
             write_ansi_256color,
         ),
@@ -113,17 +133,19 @@ fn process_line_streaming<W: Write>(
 /// need detection (both single-byte ASCII). Multi-byte codepoints are copied as
 /// raw bytes; the phase counter advances only on codepoint-start bytes.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn process_line_with_color<W: Write, F>(
     line: &[u8],
     start_pos: f64,
     config: &Config,
     lookup: &RainbowLookup,
-    out: &mut [u8; BUF_CAP],
+    out: &mut [u8; OUT_CAP],
+    j: usize,
     writer: &mut W,
     write_ansi: F,
-) -> Result<()>
+) -> Result<usize>
 where
-    F: Fn(&mut [u8; BUF_CAP], usize, usize, &RainbowLookup) -> usize,
+    F: Fn(&mut [u8; OUT_CAP], usize, usize, &RainbowLookup) -> usize,
 {
     // Fixed-point phase accumulator - eliminates all float ops in hot path
     let pos_increment = 1.0 / config.spread;
@@ -137,7 +159,7 @@ where
     let mut i = 0;
     // Write cursor into `out`. ANSI writers return the offset for the
     // following character byte (overwriting the truecolor padding slot).
-    let mut j = 0;
+    let mut j = j;
 
     // Optimization: if phase_inc is small, we can process chunks of characters
     // that share the same color index without recalculating it.
@@ -158,7 +180,7 @@ where
 
             if b == b'\t' {
                 i += 1;
-                if BUF_CAP - j < FLUSH_MARGIN {
+                if OUT_CAP - j < FLUSH_MARGIN {
                     writer.write_all(&out[..j])?;
                     j = 0;
                 }
@@ -176,7 +198,7 @@ where
             }
 
             // Normal character batching
-            if BUF_CAP - j < FLUSH_MARGIN {
+            if OUT_CAP - j < FLUSH_MARGIN {
                 writer.write_all(&out[..j])?;
                 j = 0;
             }
@@ -195,7 +217,7 @@ where
             // the start byte and continuation bytes, corrupting the character.
             // The first iteration always writes (bytes[i] is a normal char and
             // max_run >= 1), so the truecolor padding slot is always overwritten.
-            while i < len && BUF_CAP - j > 4 {
+            while i < len && OUT_CAP - j > 4 {
                 let b2 = bytes[i];
                 if b2 == 0x1b || b2 == b'\t' {
                     break;
@@ -222,7 +244,7 @@ where
         // Each char needs at most 20 bytes (19-byte ANSI + 1-byte char, sharing
         // the padding slot). If the entire line fits in the buffer AND contains
         // no special bytes, skip per-char ESC/tab/capacity/UTF-8 checks entirely.
-        let fits_in_buf = len <= (BUF_CAP - 24) / 20;
+        let fits_in_buf = len <= (LINE_MARGIN - 24) / 20;
         let no_special = fits_in_buf && !bytes.iter().any(|&b| b == 0x1b || b == b'\t');
         let all_ascii = no_special && bytes.iter().all(|&b| b < 0x80);
 
@@ -287,7 +309,7 @@ where
 
                 if b == b'\t' {
                     i += 1;
-                    if BUF_CAP - j < FLUSH_MARGIN {
+                    if OUT_CAP - j < FLUSH_MARGIN {
                         writer.write_all(&out[..j])?;
                         j = 0;
                     }
@@ -308,7 +330,7 @@ where
                 // Continuation bytes (0x80–0xBF) just get pushed; headroom is guaranteed
                 // by the flush check on each start byte (max 20-byte ANSI + 4-byte codepoint < 32).
                 if b < 0x80 || b >= 0xC0 {
-                    if BUF_CAP - j < 32 {
+                    if OUT_CAP - j < 32 {
                         writer.write_all(&out[..j])?;
                         j = 0;
                     }
@@ -327,32 +349,31 @@ where
         }
     }
 
-    // Append newline and write in one syscall
+    // Append newline; the accumulated output is flushed by the caller
     out[j] = b'\n';
     j += 1;
-    writer
-        .write_all(&out[..j])
-        .context("Failed to write final buffered line")?;
 
-    Ok(())
+    Ok(j)
 }
 
 /// Optimized batch processing for better performance with large inputs
 struct BatchProcessor<W: Write> {
-    writer: BufWriter<W>,
-    /// Reused per-line output buffer; allocated once so hot paths can use
-    /// plain index-based writes without per-push bookkeeping.
-    line_out: Box<[u8; BUF_CAP]>,
+    writer: W,
+    /// Persistent output buffer: lines accumulate here (index-based writes,
+    /// no per-push bookkeeping) and are written straight to the underlying
+    /// writer when headroom runs low — a single copy from tables to buffer.
+    out: Box<[u8; OUT_CAP]>,
+    /// Write cursor into `out`, carried across lines
+    j: usize,
     lookup: RainbowLookup,
 }
 
 impl<W: Write> BatchProcessor<W> {
     fn new(writer: W, config: &Config) -> Self {
-        // Use a larger buffer size for better performance with large files
-        const BUFFER_SIZE: usize = 256 * 1024; // 256KB buffer
         Self {
-            writer: BufWriter::with_capacity(BUFFER_SIZE, writer),
-            line_out: Box::new([0u8; BUF_CAP]),
+            writer,
+            out: Box::new([0u8; OUT_CAP]),
+            j: 0,
             lookup: RainbowLookup::new(config.frequency),
         }
     }
@@ -364,21 +385,34 @@ impl<W: Write> BatchProcessor<W> {
         config: &Config,
         color_mode: ColorMode,
     ) -> Result<()> {
-        process_line_streaming(
+        // Guarantee LINE_MARGIN headroom so short lines run checkless
+        if OUT_CAP - self.j < LINE_MARGIN {
+            self.writer
+                .write_all(&self.out[..self.j])
+                .context("Failed to write output batch")?;
+            self.j = 0;
+        }
+        self.j = process_line_streaming(
             line,
             start_pos,
             config,
             color_mode,
             &self.lookup,
-            &mut self.line_out,
+            &mut self.out,
+            self.j,
             &mut self.writer,
         )?;
         Ok(())
     }
 
     fn finish(mut self) -> Result<()> {
+        self.writer
+            .write_all(&self.out[..self.j])
+            .context("Failed to write final batch")?;
         // Comprehensive terminal reset sequence
-        write!(self.writer, "\x1b[0m\x1b[39m\x1b[49m").context("Failed to write terminal reset")?;
+        self.writer
+            .write_all(b"\x1b[0m\x1b[39m\x1b[49m")
+            .context("Failed to write terminal reset")?;
         self.writer.flush().context("Failed to flush final batch")
     }
 }
