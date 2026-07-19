@@ -428,6 +428,69 @@ impl<W: Write> BatchProcessor<W> {
         }
     }
 
+    /// Whether the fused clean-ASCII chunk path applies: TrueColor output and
+    /// a color index that advances on every character.
+    fn fused_chunk_eligible(&self, color_mode: ColorMode) -> bool {
+        color_mode == ColorMode::TrueColor && self.phase_inc >= (1 << 32)
+    }
+
+    /// Process every complete line of a pre-verified clean chunk (pure ASCII,
+    /// no ESC/tab/CR) with zero per-line classification or dispatch.
+    /// Returns (bytes consumed, lines processed), capped at `line_limit`.
+    fn process_clean_ascii_chunk(
+        &mut self,
+        chunk: &[u8],
+        line_limit: usize,
+    ) -> Result<(usize, usize)> {
+        let mut j = self.j;
+        let mut phase_line = self.phase;
+        let mut offset = 0;
+        let mut lines = 0;
+        for nl in memchr::memchr_iter(b'\n', chunk) {
+            let line = &chunk[offset..nl];
+            if OUT_CAP - j < LINE_MARGIN {
+                self.writer
+                    .write_all(&self.out[..j])
+                    .context("Failed to write output batch")?;
+                j = 0;
+            }
+            if line.len() <= (LINE_MARGIN - 24) / 20 {
+                let mut phase = phase_line;
+                let dst = &mut self.out[j..j + line.len() * 20];
+                for (c, &b) in dst.chunks_exact_mut(20).zip(line) {
+                    let color_idx = self.lookup.color_index_from_phase(phase);
+                    c.copy_from_slice(self.lookup.get_truecolor_ansi_fixed(color_idx));
+                    c[19] = b;
+                    phase = phase.wrapping_add(self.phase_inc);
+                }
+                j += line.len() * 20;
+                self.out[j] = b'\n';
+                j += 1;
+            } else {
+                // Oversized line: the general path handles mid-line flushing
+                j = process_line_streaming(
+                    line,
+                    phase_line,
+                    self.phase_inc,
+                    ColorMode::TrueColor,
+                    &self.lookup,
+                    &mut self.out,
+                    j,
+                    &mut self.writer,
+                )?;
+            }
+            phase_line = phase_line.wrapping_add(self.line_phase_inc);
+            offset = nl + 1;
+            lines += 1;
+            if lines >= line_limit {
+                break;
+            }
+        }
+        self.j = j;
+        self.phase = phase_line;
+        Ok((offset, lines))
+    }
+
     fn process_line(&mut self, line: &[u8], color_mode: ColorMode) -> Result<()> {
         // Guarantee LINE_MARGIN headroom so short lines run checkless
         if OUT_CAP - self.j < LINE_MARGIN {
@@ -460,6 +523,22 @@ impl<W: Write> BatchProcessor<W> {
             .context("Failed to write terminal reset")?;
         self.writer.flush().context("Failed to flush final batch")
     }
+}
+
+/// Whether the chunk is pure ASCII with no ESC, tab, or CR — eligible for the
+/// fused colorize path. Scans blockwise (branchless within a block, so it
+/// vectorizes) with early exit between blocks for quick rejection.
+fn is_clean_ascii(chunk: &[u8]) -> bool {
+    for block in chunk.chunks(1024) {
+        let mut dirty = false;
+        for &b in block {
+            dirty |= (b >= 0x80) | (b == 0x1b) | (b == b'\t') | (b == b'\r');
+        }
+        if dirty {
+            return false;
+        }
+    }
+    true
 }
 
 /// Process input with a specific color mode (for testing/benchmarking)
@@ -514,22 +593,29 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
             if available.is_empty() {
                 break;
             }
-            let mut offset = 0;
-            for nl in memchr::memchr_iter(b'\n', available) {
-                let before_nl = &available[offset..nl];
-                let line = if before_nl.last() == Some(&b'\r') {
-                    &before_nl[..before_nl.len() - 1]
-                } else {
-                    before_nl
-                };
-                processor.process_line(line, color_mode)?;
-                lines_read += 1;
-                offset = nl + 1;
-                if lines_read >= MAX_LINES {
-                    break;
+            if processor.fused_chunk_eligible(color_mode) && is_clean_ascii(available) {
+                let (consumed, lines) =
+                    processor.process_clean_ascii_chunk(available, MAX_LINES - lines_read)?;
+                lines_read += lines;
+                consumed
+            } else {
+                let mut offset = 0;
+                for nl in memchr::memchr_iter(b'\n', available) {
+                    let before_nl = &available[offset..nl];
+                    let line = if before_nl.last() == Some(&b'\r') {
+                        &before_nl[..before_nl.len() - 1]
+                    } else {
+                        before_nl
+                    };
+                    processor.process_line(line, color_mode)?;
+                    lines_read += 1;
+                    offset = nl + 1;
+                    if lines_read >= MAX_LINES {
+                        break;
+                    }
                 }
+                offset
             }
-            offset
         };
 
         if consumed > 0 {
