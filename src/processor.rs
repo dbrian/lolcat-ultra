@@ -76,16 +76,14 @@ fn write_ansi_256color(
 /// at entry; oversized lines flush `out` to `writer` mid-line as needed.
 fn process_line_streaming<W: Write>(
     line: &[u8],
-    start_pos: f64,
-    config: &Config,
+    phase0: u64,
+    phase_inc: u64,
     color_mode: ColorMode,
     lookup: &RainbowLookup,
     out: &mut [u8; OUT_CAP],
     j: usize,
     writer: &mut W,
 ) -> Result<usize> {
-    debug_assert!(start_pos.is_finite(), "Start position must be finite");
-
     // Dispatch to monomorphic implementation based on color mode
     match color_mode {
         ColorMode::NoColor => {
@@ -106,8 +104,8 @@ fn process_line_streaming<W: Write>(
         }
         ColorMode::TrueColor => process_line_with_color::<_, _, true>(
             line,
-            start_pos,
-            config,
+            phase0,
+            phase_inc,
             lookup,
             out,
             j,
@@ -116,8 +114,8 @@ fn process_line_streaming<W: Write>(
         ),
         ColorMode::Color256 => process_line_with_color::<_, _, false>(
             line,
-            start_pos,
-            config,
+            phase0,
+            phase_inc,
             lookup,
             out,
             j,
@@ -136,8 +134,8 @@ fn process_line_streaming<W: Write>(
 #[allow(clippy::too_many_arguments)]
 fn process_line_with_color<W: Write, F, const FIXED_ANSI: bool>(
     line: &[u8],
-    start_pos: f64,
-    config: &Config,
+    phase0: u64,
+    phase_inc: u64,
     lookup: &RainbowLookup,
     out: &mut [u8; OUT_CAP],
     j: usize,
@@ -147,9 +145,8 @@ fn process_line_with_color<W: Write, F, const FIXED_ANSI: bool>(
 where
     F: Fn(&mut [u8; OUT_CAP], usize, usize, &RainbowLookup) -> usize,
 {
-    // Fixed-point phase accumulator - eliminates all float ops in hot path
-    let pos_increment = 1.0 / config.spread;
-    let (mut phase, phase_inc) = lookup.fixedpoint_phase(start_pos, pos_increment);
+    // Fixed-point phase accumulator - no float ops anywhere in the hot path
+    let mut phase = phase0;
 
     // Track last color index to avoid redundant ANSI sequences
     let mut last_color_idx: Option<usize> = None;
@@ -402,26 +399,36 @@ struct BatchProcessor<W: Write> {
     out: Box<[u8; OUT_CAP]>,
     /// Write cursor into `out`, carried across lines
     j: usize,
+    /// Fixed-point phase at the start of the current line
+    phase: u64,
+    /// Fixed-point phase advance per line (spread positions)
+    line_phase_inc: u64,
+    /// Fixed-point phase advance per character
+    phase_inc: u64,
     lookup: RainbowLookup,
 }
 
 impl<W: Write> BatchProcessor<W> {
     fn new(writer: W, config: &Config) -> Self {
+        let lookup = RainbowLookup::new(config.frequency);
+        // All phase math is precomputed once: the line start phase advances
+        // incrementally by `line_phase_inc` per line instead of being derived
+        // from floats per line. The truncation drift versus exact per-line
+        // float math stays far below one table index over billions of lines.
+        let (phase, phase_inc) = lookup.fixedpoint_phase(config.random_offset, 1.0 / config.spread);
+        let (line_phase_inc, _) = lookup.fixedpoint_phase(config.spread, 1.0);
         Self {
             writer,
             out: Box::new([0u8; OUT_CAP]),
             j: 0,
-            lookup: RainbowLookup::new(config.frequency),
+            phase,
+            line_phase_inc,
+            phase_inc,
+            lookup,
         }
     }
 
-    fn process_line(
-        &mut self,
-        line: &[u8],
-        start_pos: f64,
-        config: &Config,
-        color_mode: ColorMode,
-    ) -> Result<()> {
+    fn process_line(&mut self, line: &[u8], color_mode: ColorMode) -> Result<()> {
         // Guarantee LINE_MARGIN headroom so short lines run checkless
         if OUT_CAP - self.j < LINE_MARGIN {
             self.writer
@@ -431,14 +438,15 @@ impl<W: Write> BatchProcessor<W> {
         }
         self.j = process_line_streaming(
             line,
-            start_pos,
-            config,
+            self.phase,
+            self.phase_inc,
             color_mode,
             &self.lookup,
             &mut self.out,
             self.j,
             &mut self.writer,
         )?;
+        self.phase = self.phase.wrapping_add(self.line_phase_inc);
         Ok(())
     }
 
@@ -514,8 +522,7 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
                 } else {
                     before_nl
                 };
-                let start_pos = (lines_read as f64) * config.spread + config.random_offset;
-                processor.process_line(line, start_pos, config, color_mode)?;
+                processor.process_line(line, color_mode)?;
                 lines_read += 1;
                 offset = nl + 1;
                 if lines_read >= MAX_LINES {
@@ -543,8 +550,7 @@ pub fn process_input_with_color_mode<R: BufRead, W: Write>(
                     line_len -= 1;
                 }
             }
-            let start_pos = (lines_read as f64) * config.spread + config.random_offset;
-            processor.process_line(&line_buf[..line_len], start_pos, config, color_mode)?;
+            processor.process_line(&line_buf[..line_len], color_mode)?;
             lines_read += 1;
         }
     }
